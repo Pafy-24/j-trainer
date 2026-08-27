@@ -1,0 +1,160 @@
+{
+  "$defs": {
+    "DatasetFile": {
+      "additionalProperties": false,
+      "properties": {
+        "split": {
+          "enum": [
+            "pretraining",
+            "train",
+            "validation",
+            "test"
+          ],
+          "title": "Split",
+          "type": "string"
+        },
+        "digest": {
+          "title": "Digest",
+          "type": "string"
+        },
+        "path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Path"
+        },
+        "artifactDigest": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Artifactdigest"
+        },
+        "logicalPath": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Logicalpath"
+        },
+        "records": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Records"
+        }
+      },
+      "required": [
+        "split",
+        "digest"
+      ],
+      "title": "DatasetFile",
+      "type": "object"
+    },
+    "Metadata": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "displayName": {
+          "default": "",
+          "title": "Displayname",
+          "type": "string"
+        },
+        "labels": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Labels",
+          "type": "object"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "title": "Metadata",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "apiVersion": {
+      "const": "jester.trainer/v1",
+      "default": "jester.trainer/v1",
+      "title": "Apiversion",
+      "type": "string"
+    },
+    "kind": {
+      "const": "DatasetManifest",
+      "default": "DatasetManifest",
+      "title": "Kind",
+      "type": "string"
+    },
+    "metadata": {
+      "$ref": "#/$defs/Metadata"
+    },
+    "files": {
+      "items": {
+        "$ref": "#/$defs/DatasetFile"
+      },
+      "title": "Files",
+      "type": "array"
+    },
+    "semanticCaseIdField": {
+      "default": "semanticCaseId",
+      "title": "Semanticcaseidfield",
+      "type": "string"
+    },
+    "seed": {
+      "default": 42,
+      "title": "Seed",
+      "type": "integer"
+    },
+    "generation": {
+      "default": 1,
+      "minimum": 1,
+      "title": "Generation",
+      "type": "integer"
+    },
+    "createdAt": {
+      "title": "Createdat",
+      "type": "string"
+    },
+    "updatedAt": {
+      "title": "Updatedat",
+      "type": "string"
+    }
+  },
+  "required": [
+    "metadata",
+    "files"
+  ],
+  "title": "DatasetManifest",
+  "type": "object",
+  "$id": "https://jester.local/schemas/trainer/v1/dataset-manifest.schema.json"
+}

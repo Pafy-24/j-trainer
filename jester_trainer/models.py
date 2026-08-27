@@ -198,6 +198,7 @@ class CheckpointSpec(APIModel):
     save_every_rounds: int = Field(default=1, alias="saveEveryRounds", ge=1)
     max_retries: int = Field(default=1, alias="maxRetries", ge=0, le=20)
     resume_from: str | None = Field(default=None, alias="resumeFrom")
+    initial_weights: str | None = Field(default=None, alias="initialWeights")
 
 
 class SelectionSpec(APIModel):
@@ -328,6 +329,7 @@ class TrainingResult(APIModel):
     facet_reference: str = Field(alias="facetReference")
     artifact_path: str = Field(alias="artifactPath")
     artifact_sha256: str = Field(alias="artifactSha256")
+    artifact_digest: str | None = Field(default=None, alias="artifactDigest")
     metrics: dict[str, Any] = Field(default_factory=dict)
     promoted: bool = False
     generation: int = Field(default=1, ge=1)

@@ -1,0 +1,55 @@
+{
+  "apiVersion": "jester.trainer/v1",
+  "kind": "Campaign",
+  "metadata": {
+    "id": "coder-two-workers",
+    "displayName": "Coder synchronous training"
+  },
+  "spec": {
+    "topologyId": "training-small",
+    "datasets": [{"datasetId": "coder-data-v1", "split": "train"}],
+    "facets": [
+      {
+        "id": "coder",
+        "miConfig": {
+          "schemaVersion": "mi-training-v1",
+          "baseModel": {
+            "id": "rm-artifact-pending",
+            "device": "managed",
+            "dtype": "float32",
+            "artifactDigest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+          },
+          "registry": "artifacts/facets",
+          "facet": {
+            "id": "coder",
+            "version": "1",
+            "dependencies": {},
+            "module": {
+              "type": "full-decoder-block",
+              "placement": {"strategy": "uniform", "slotCount": 2, "blocksPerSlot": [1, 1]}
+            }
+          },
+          "data": {"train": [], "maxSequenceLength": 1024}
+        }
+      }
+    ],
+    "mode": "parameter-server",
+    "cohort": {"size": 2},
+    "optimizer": {"type": "adamw", "learningRate": 0.0002},
+    "scheduler": {"type": "cosine", "warmupSteps": 10},
+    "training": {
+      "maxSteps": 100,
+      "examplesPerWorker": 4,
+      "batchSize": 1,
+      "precision": "float32",
+      "transportDtype": "float32",
+      "compression": "zstd"
+    },
+    "checkpoint": {
+      "outputDirectory": "artifacts/trainer-results",
+      "saveEveryRounds": 10,
+      "maxRetries": 1
+    },
+    "acceptSshDataPlane": false
+  }
+}

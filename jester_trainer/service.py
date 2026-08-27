@@ -102,14 +102,41 @@ class TrainerService:
             except TrainerError as exc:
                 rm_error = {"code": exc.code, "detail": str(exc)}
         samples = list((rm_metrics or {}).get("samples", []))
-        latest: dict[tuple[str, str, str], dict[str, Any]] = {}
+        latest: dict[tuple[str, ...], dict[str, Any]] = {}
         for sample in samples:
             key = (
                 str(sample.get("hostId")),
                 str(sample.get("instanceId")),
+                str(sample.get("leaseId")),
+                str(sample.get("pid")),
+                str(sample.get("processCreateTime")),
+                str(sample.get("role")),
+                str(sample.get("resourceId")),
                 str(sample.get("metric")),
             )
-            latest[key] = sample
+            previous = latest.get(key)
+            if previous is None or str(sample.get("sampledAt", "")) >= str(
+                previous.get("sampledAt", "")
+            ):
+                latest[key] = sample
+        accelerator_by_process: dict[tuple[str, ...], int] = {}
+        for item in latest.values():
+            if item.get("metric") not in {
+                "process.accelerator.memory.used",
+                "accelerator.memory.allocated",
+                "accelerator.memory.reserved",
+            }:
+                continue
+            key = (
+                str(item.get("hostId")),
+                str(item.get("instanceId")),
+                str(item.get("pid")),
+                str(item.get("processCreateTime")),
+                str(item.get("resourceId")),
+            )
+            accelerator_by_process[key] = max(
+                accelerator_by_process.get(key, 0), int(item.get("value", 0))
+            )
         measured = {
             "cpuPercent": sum(
                 float(item.get("value", 0))
@@ -121,16 +148,17 @@ class TrainerService:
                 for item in latest.values()
                 if item.get("metric") == "process.memory.rss"
             ),
-            "acceleratorMemoryBytes": sum(
-                int(item.get("value", 0))
-                for item in latest.values()
-                if item.get("metric")
-                in {
-                    "accelerator.memory.allocated",
-                    "accelerator.memory.reserved",
-                }
-            ),
+            "acceleratorMemoryBytes": sum(accelerator_by_process.values()),
         }
+        trainer_instance_id = str(self.settings.lease.get("instanceId", ""))
+        trainer_seen = any(
+            str(item.get("instanceId", "")) == trainer_instance_id
+            and item.get("metric") in {"process.cpu.percent", "process.memory.rss"}
+            for item in latest.values()
+        )
+        if not trainer_seen:
+            measured["cpuPercent"] += own["cpuPercent"]
+            measured["ramBytes"] += own["ramBytes"]
         return {
             "topologyId": self.settings.topology.get("topologyId"),
             "trainer": own,
@@ -138,6 +166,7 @@ class TrainerService:
             "physicalCapacity": (rm_metrics or {}).get("physicalCapacity", []),
             "channels": (rm_metrics or {}).get("channels", []),
             "source": "rm-topology-metrics" if rm_metrics else "trainer-process-only",
+            "trainerIncludedByRM": trainer_seen,
             "rmError": rm_error,
         }
 
@@ -198,6 +227,14 @@ class TrainerService:
             )
         for use in campaign.spec.datasets:
             self.get_dataset(use.dataset_id)
+        if self.rm.available:
+            campaign = campaign.model_copy(deep=True)
+            campaign.spec.checkpoint.output_directory = str(
+                self._managed_path(campaign.spec.checkpoint.output_directory)
+            )
+            self._relative_to_instance_root(
+                Path(campaign.spec.checkpoint.output_directory)
+            )
         return self._put_new_or_expected(
             "campaign",
             campaign.metadata.id,
@@ -254,7 +291,9 @@ class TrainerService:
         for manifest, _ in manifests:
             self.datasets.validate(manifest)
         workers = self.pool.select(
-            campaign.spec.cohort.worker_ids, campaign.spec.cohort.size
+            campaign.spec.cohort.worker_ids,
+            campaign.spec.cohort.size,
+            retain_pool=campaign.spec.mode == "independent",
         )
         self._validate_cohort(campaign, workers)
         existing = self.campaign_jobs(campaign_id)
@@ -453,7 +492,9 @@ class TrainerService:
                 if item.get("state") not in {"succeeded", "cancelled"}
             }
             selected_pool = self.pool.select(
-                campaign.spec.cohort.worker_ids, campaign.spec.cohort.size
+                campaign.spec.cohort.worker_ids,
+                campaign.spec.cohort.size,
+                retain_pool=campaign.spec.mode == "independent",
             )
             available = {
                 worker.descriptor.worker_id: worker for worker in selected_pool
@@ -684,6 +725,12 @@ class TrainerService:
         )
         try:
             result = server.run()
+            published_digest = None
+            if self.rm.available:
+                published = self.rm.publish_artifact(
+                    self._relative_to_instance_root(result.artifact_path)
+                )
+                published_digest = published["artifact"]["digest"]
             succeeded_attempt = attempt.model_copy(
                 update={"state": "succeeded", "completed_at": utc_now()}
             )
@@ -701,6 +748,7 @@ class TrainerService:
                 facetReference=result.facet_reference,
                 artifactPath=str(result.artifact_path),
                 artifactSha256=result.artifact_sha256,
+                artifactDigest=published_digest,
                 metrics=result.metrics,
             )
             stored_result = TrainingResult.model_validate(
@@ -820,18 +868,37 @@ class TrainerService:
     def _validate_cohort(
         self, campaign: Campaign, workers: list[WorkerClient]
     ) -> None:
+        if campaign.spec.mode == "parameter-server":
+            backends = {worker.descriptor.effective_backend for worker in workers}
+            protocols = {worker.descriptor.protocol for worker in workers}
+            if len(backends) != 1:
+                raise ConflictError(
+                    f"Synchronous cohort backends are heterogeneous: {sorted(backends)}",
+                    code="heterogeneous_cohort_backend",
+                )
+            if protocols != {"http-json+binary"}:
+                raise ConflictError(
+                    "Synchronous cohorts require http-json+binary channels",
+                    code="incompatible_worker_protocol",
+                )
         capabilities: list[dict[str, Any]] = []
         for worker in workers:
             capabilities.append(worker.json("GET", "/v1/capabilities"))
-        # Session preflight performs exact base/model/precision comparison. At
-        # planning time ensure every selected worker has at least one autograd backend.
         for worker, capability in zip(workers, capabilities):
-            if not any(
-                item.get("workerCompatible") and item.get("autogradCapable")
-                for item in capability.get("backends", [])
+            effective = worker.descriptor.effective_backend
+            match = next(
+                (
+                    item
+                    for item in capability.get("backends", [])
+                    if item.get("backend") == effective
+                ),
+                None,
+            )
+            if not match or not (
+                match.get("workerCompatible") and match.get("autogradCapable")
             ):
                 raise ConflictError(
-                    f"Worker {worker.descriptor.worker_id} has no compatible autograd backend",
+                    f"Worker {worker.descriptor.worker_id} cannot train on effective backend {effective}",
                     code="worker_not_autograd_capable",
                 )
 
@@ -871,7 +938,10 @@ class TrainerService:
                     results, key=lambda item: float(item.metrics[selection.metric])
                 )
             )
-        registry = Path(str(mi_config.get("registry", "artifacts/facets"))).expanduser().resolve()
+        registry = self._managed_path(
+            str(mi_config.get("registry", "facets"))
+        )
+        mi_config["registry"] = str(registry)
         for result in selected:
             facet_id, _, version = result.facet_reference.partition("@")
             destination = registry / facet_id / version
@@ -884,6 +954,11 @@ class TrainerService:
                 )
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copytree(result.artifact_path, destination)
+        if self.rm.available:
+            published = self.rm.publish_artifact(
+                self._relative_to_instance_root(registry)
+            )
+            mi_config["registryArtifactDigest"] = published["artifact"]["digest"]
 
     @staticmethod
     def _latest_checkpoint(attempt_directory: Path) -> Path | None:
@@ -974,6 +1049,33 @@ class TrainerService:
             payload,
             expected_generation=expected_generation,
         )
+
+    def _relative_to_instance_root(self, path: Path) -> str:
+        raw_root = self.settings.lease.get("paths", {}).get("root")
+        if not raw_root:
+            raise TrainerError(
+                "RM lease does not expose an instance root",
+                code="rm_instance_root_unavailable",
+                status=409,
+            )
+        root = Path(str(raw_root)).resolve()
+        resolved = path.resolve()
+        try:
+            return resolved.relative_to(root).as_posix()
+        except ValueError as exc:
+            raise TrainerError(
+                f"Trainer path must remain inside the RM instance volume: {resolved}",
+                code="trainer_path_outside_lease",
+                status=422,
+            ) from exc
+
+    def _managed_path(self, value: str) -> Path:
+        path = Path(value).expanduser()
+        if path.is_absolute() or not self.rm.available:
+            return path.resolve()
+        paths = self.settings.lease.get("paths", {})
+        base = Path(str(paths.get("artifacts") or paths.get("root"))).resolve()
+        return (base / path).resolve()
 
     def _put_new_or_expected(
         self,

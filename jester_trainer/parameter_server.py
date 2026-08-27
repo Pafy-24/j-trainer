@@ -78,6 +78,7 @@ class ParameterServer:
             worker.descriptor.worker_id: 0.0 for worker in workers
         }
         self.total_supervised_tokens = 0
+        self.artifact_bindings: list[dict[str, Any]] = []
 
     def run(self) -> ParameterServerResult:
         self.output.mkdir(parents=True, exist_ok=True)
@@ -242,6 +243,7 @@ class ParameterServer:
                 "effectiveBackend": worker.descriptor.effective_backend,
                 "fallbackReason": worker.descriptor.fallback_reason,
                 "allowCpuFallback": self.campaign.spec.allow_cpu_fallback,
+                "artifactBindings": self.artifact_bindings,
                 "transport": {
                     "compression": self.campaign.spec.training.compression,
                     "dtype": self.campaign.spec.training.transport_dtype,
@@ -266,10 +268,40 @@ class ParameterServer:
     def _worker_training_config(self) -> dict[str, Any]:
         config = copy.deepcopy(self.mi_config)
         config["schemaVersion"] = "mi-training-v1"
+        bindings: list[dict[str, Any]] = []
+        base = config.setdefault("baseModel", {})
+        base_digest = base.pop("artifactDigest", None)
+        base_logical = base.pop("artifactLogicalPath", None)
+        if base_digest:
+            bindings.append(
+                {
+                    "target": "/baseModel/id",
+                    "digest": base_digest,
+                    "logicalPath": base_logical,
+                }
+            )
+            base["id"] = "rm-artifact-pending"
+        registry_digest = config.pop("registryArtifactDigest", None)
+        if registry_digest:
+            bindings.append(
+                {
+                    "target": "/registry",
+                    "digest": registry_digest,
+                }
+            )
+            config["registry"] = "rm-artifact-pending"
         data = config.setdefault("data", {})
-        data["train"] = [
-            {"path": source["path"]} for source in self.shard_plan["sources"]
-        ]
+        data["train"] = []
+        for index, source in enumerate(self.shard_plan["sources"]):
+            data["train"].append({"path": source["path"]})
+            if source.get("artifactDigest"):
+                bindings.append(
+                    {
+                        "target": f"/data/train/{index}/path",
+                        "digest": source["artifactDigest"],
+                        "logicalPath": source.get("logicalPath"),
+                    }
+                )
         data["shuffle"] = False
         data["packing"] = False
         data["numWorkers"] = 0
@@ -288,10 +320,26 @@ class ParameterServer:
             "overwrite": True,
             "saveOptimizer": False,
         }
+        self.artifact_bindings = bindings
         return config
 
     def _initialize_parameters(self, path: Path) -> None:
         state = load_file(str(path), device="cpu")
+        initial = self.campaign.spec.checkpoint.initial_weights
+        if initial:
+            migrated = load_file(str(Path(initial).expanduser().resolve()), device="cpu")
+            if set(migrated) != set(state):
+                raise ConflictError(
+                    "Migrated initial weight tensor set differs from the worker child facet",
+                    code="initial_weight_tensor_mismatch",
+                )
+            for name, tensor in migrated.items():
+                if tuple(tensor.shape) != tuple(state[name].shape) or not torch.isfinite(tensor).all():
+                    raise ConflictError(
+                        f"Migrated initial tensor {name} has invalid shape or values",
+                        code="initial_weight_tensor_mismatch",
+                    )
+            state = migrated
         if not state:
             raise TrainerError(
                 "Worker returned an empty child weight set",
@@ -736,3 +784,23 @@ class ParameterServer:
                 code="ssh_data_plane_confirmation_required",
                 status=409,
             )
+        if ssh:
+            missing_datasets = [
+                source["path"]
+                for source in self.shard_plan.get("sources", [])
+                if not source.get("artifactDigest")
+            ]
+            if missing_datasets:
+                raise TrainerError(
+                    "Remote workers require every gradient dataset source in the RM CAS",
+                    code="remote_dataset_requires_cas",
+                    status=409,
+                    fields={"localPaths": missing_datasets},
+                )
+            base = self.mi_config.get("baseModel", {})
+            if not isinstance(base, dict) or not base.get("artifactDigest"):
+                raise TrainerError(
+                    "Remote workers require baseModel.artifactDigest from the RM CAS",
+                    code="remote_base_model_requires_cas",
+                    status=409,
+                )

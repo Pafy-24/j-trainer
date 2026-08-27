@@ -1,0 +1,502 @@
+{
+  "$defs": {
+    "CampaignSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "topologyId": {
+          "title": "Topologyid",
+          "type": "string"
+        },
+        "datasets": {
+          "items": {
+            "$ref": "#/$defs/DatasetUse"
+          },
+          "title": "Datasets",
+          "type": "array"
+        },
+        "facets": {
+          "items": {
+            "$ref": "#/$defs/FacetNodeSpec"
+          },
+          "title": "Facets",
+          "type": "array"
+        },
+        "mode": {
+          "default": "parameter-server",
+          "enum": [
+            "independent",
+            "parameter-server"
+          ],
+          "title": "Mode",
+          "type": "string"
+        },
+        "cohort": {
+          "$ref": "#/$defs/CohortSpec"
+        },
+        "optimizer": {
+          "$ref": "#/$defs/OptimizerSpec"
+        },
+        "scheduler": {
+          "$ref": "#/$defs/SchedulerSpec"
+        },
+        "training": {
+          "$ref": "#/$defs/TrainingSpec"
+        },
+        "checkpoint": {
+          "$ref": "#/$defs/CheckpointSpec"
+        },
+        "selection": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SelectionSpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "acceptSshDataPlane": {
+          "default": false,
+          "title": "Acceptsshdataplane",
+          "type": "boolean"
+        },
+        "allowCpuFallback": {
+          "default": false,
+          "title": "Allowcpufallback",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "topologyId",
+        "datasets",
+        "facets",
+        "training",
+        "checkpoint"
+      ],
+      "title": "CampaignSpec",
+      "type": "object"
+    },
+    "CampaignState": {
+      "enum": [
+        "draft",
+        "validating",
+        "planned",
+        "queued",
+        "running",
+        "paused",
+        "succeeded",
+        "failed",
+        "cancelled",
+        "recovering"
+      ],
+      "title": "CampaignState",
+      "type": "string"
+    },
+    "CandidateSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "overrides": {
+          "additionalProperties": true,
+          "title": "Overrides",
+          "type": "object"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "title": "CandidateSpec",
+      "type": "object"
+    },
+    "CheckpointSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "outputDirectory": {
+          "title": "Outputdirectory",
+          "type": "string"
+        },
+        "saveEveryRounds": {
+          "default": 1,
+          "minimum": 1,
+          "title": "Saveeveryrounds",
+          "type": "integer"
+        },
+        "maxRetries": {
+          "default": 1,
+          "maximum": 20,
+          "minimum": 0,
+          "title": "Maxretries",
+          "type": "integer"
+        },
+        "resumeFrom": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Resumefrom"
+        },
+        "initialWeights": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Initialweights"
+        }
+      },
+      "required": [
+        "outputDirectory"
+      ],
+      "title": "CheckpointSpec",
+      "type": "object"
+    },
+    "CohortSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "workerIds": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Workerids",
+          "type": "array"
+        },
+        "size": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Size"
+        }
+      },
+      "title": "CohortSpec",
+      "type": "object"
+    },
+    "DatasetUse": {
+      "additionalProperties": false,
+      "properties": {
+        "datasetId": {
+          "title": "Datasetid",
+          "type": "string"
+        },
+        "split": {
+          "default": "train",
+          "enum": [
+            "pretraining",
+            "train",
+            "validation"
+          ],
+          "title": "Split",
+          "type": "string"
+        },
+        "weight": {
+          "default": 1.0,
+          "exclusiveMinimum": 0,
+          "title": "Weight",
+          "type": "number"
+        }
+      },
+      "required": [
+        "datasetId"
+      ],
+      "title": "DatasetUse",
+      "type": "object"
+    },
+    "FacetNodeSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "dependsOn": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Dependson",
+          "type": "array"
+        },
+        "miConfig": {
+          "additionalProperties": true,
+          "title": "Miconfig",
+          "type": "object"
+        },
+        "candidates": {
+          "items": {
+            "$ref": "#/$defs/CandidateSpec"
+          },
+          "title": "Candidates",
+          "type": "array"
+        }
+      },
+      "required": [
+        "id",
+        "miConfig"
+      ],
+      "title": "FacetNodeSpec",
+      "type": "object"
+    },
+    "Metadata": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "displayName": {
+          "default": "",
+          "title": "Displayname",
+          "type": "string"
+        },
+        "labels": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Labels",
+          "type": "object"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "title": "Metadata",
+      "type": "object"
+    },
+    "OptimizerSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "default": "adamw",
+          "enum": [
+            "adamw",
+            "sgd"
+          ],
+          "title": "Type",
+          "type": "string"
+        },
+        "learningRate": {
+          "default": 0.0002,
+          "exclusiveMinimum": 0,
+          "title": "Learningrate",
+          "type": "number"
+        },
+        "weightDecay": {
+          "default": 0.0,
+          "minimum": 0,
+          "title": "Weightdecay",
+          "type": "number"
+        },
+        "betas": {
+          "default": [
+            0.9,
+            0.999
+          ],
+          "maxItems": 2,
+          "minItems": 2,
+          "prefixItems": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            }
+          ],
+          "title": "Betas",
+          "type": "array"
+        },
+        "eps": {
+          "default": 1e-08,
+          "exclusiveMinimum": 0,
+          "title": "Eps",
+          "type": "number"
+        },
+        "momentum": {
+          "default": 0.0,
+          "exclusiveMaximum": 1,
+          "minimum": 0,
+          "title": "Momentum",
+          "type": "number"
+        }
+      },
+      "title": "OptimizerSpec",
+      "type": "object"
+    },
+    "SchedulerSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "default": "constant",
+          "enum": [
+            "constant",
+            "linear",
+            "cosine"
+          ],
+          "title": "Type",
+          "type": "string"
+        },
+        "warmupSteps": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Warmupsteps",
+          "type": "integer"
+        }
+      },
+      "title": "SchedulerSpec",
+      "type": "object"
+    },
+    "SelectionSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "metric": {
+          "title": "Metric",
+          "type": "string"
+        },
+        "mode": {
+          "default": "min",
+          "enum": [
+            "min",
+            "max"
+          ],
+          "title": "Mode",
+          "type": "string"
+        }
+      },
+      "required": [
+        "metric"
+      ],
+      "title": "SelectionSpec",
+      "type": "object"
+    },
+    "TrainingSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "maxSteps": {
+          "exclusiveMinimum": 0,
+          "title": "Maxsteps",
+          "type": "integer"
+        },
+        "examplesPerWorker": {
+          "default": 1,
+          "exclusiveMinimum": 0,
+          "title": "Examplesperworker",
+          "type": "integer"
+        },
+        "batchSize": {
+          "default": 1,
+          "exclusiveMinimum": 0,
+          "title": "Batchsize",
+          "type": "integer"
+        },
+        "precision": {
+          "default": "float32",
+          "enum": [
+            "float32",
+            "float16",
+            "bfloat16"
+          ],
+          "title": "Precision",
+          "type": "string"
+        },
+        "maxGradNorm": {
+          "default": 1.0,
+          "minimum": 0,
+          "title": "Maxgradnorm",
+          "type": "number"
+        },
+        "seed": {
+          "default": 42,
+          "title": "Seed",
+          "type": "integer"
+        },
+        "transportDtype": {
+          "default": "float32",
+          "enum": [
+            "float32",
+            "float16",
+            "bfloat16"
+          ],
+          "title": "Transportdtype",
+          "type": "string"
+        },
+        "compression": {
+          "default": "none",
+          "enum": [
+            "none",
+            "zstd"
+          ],
+          "title": "Compression",
+          "type": "string"
+        }
+      },
+      "required": [
+        "maxSteps"
+      ],
+      "title": "TrainingSpec",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "apiVersion": {
+      "const": "jester.trainer/v1",
+      "default": "jester.trainer/v1",
+      "title": "Apiversion",
+      "type": "string"
+    },
+    "kind": {
+      "const": "Campaign",
+      "default": "Campaign",
+      "title": "Kind",
+      "type": "string"
+    },
+    "metadata": {
+      "$ref": "#/$defs/Metadata"
+    },
+    "spec": {
+      "$ref": "#/$defs/CampaignSpec"
+    },
+    "state": {
+      "$ref": "#/$defs/CampaignState",
+      "default": "draft"
+    },
+    "generation": {
+      "default": 1,
+      "minimum": 1,
+      "title": "Generation",
+      "type": "integer"
+    },
+    "createdAt": {
+      "title": "Createdat",
+      "type": "string"
+    },
+    "updatedAt": {
+      "title": "Updatedat",
+      "type": "string"
+    }
+  },
+  "required": [
+    "metadata",
+    "spec"
+  ],
+  "title": "Campaign",
+  "type": "object",
+  "$id": "https://jester.local/schemas/trainer/v1/campaign.schema.json"
+}

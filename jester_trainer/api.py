@@ -114,7 +114,7 @@ def create_app(service: TrainerService | None = None) -> FastAPI:
         return trainer.idempotent(
             "datasets.create",
             idempotency_key,
-            manifest.api_dict(),
+            _idempotency_payload(manifest),
             lambda: trainer.put_dataset(manifest),
         )
 
@@ -159,7 +159,7 @@ def create_app(service: TrainerService | None = None) -> FastAPI:
         return trainer.idempotent(
             "campaigns.create",
             idempotency_key,
-            campaign.api_dict(),
+            _idempotency_payload(campaign),
             lambda: trainer.put_campaign(campaign),
         )
 
@@ -365,3 +365,17 @@ def _generation(value: str | None) -> int:
             code="invalid_if_match",
             status=422,
         ) from exc
+
+
+def _idempotency_payload(model: DatasetManifest | Campaign) -> dict[str, Any]:
+    """Hash the client-authored creation payload, not generated timestamps."""
+    payload = model.api_dict()
+    generated = {
+        "generation": "generation",
+        "created_at": "createdAt",
+        "updated_at": "updatedAt",
+    }
+    for field_name, alias in generated.items():
+        if field_name not in model.model_fields_set:
+            payload.pop(alias, None)
+    return payload

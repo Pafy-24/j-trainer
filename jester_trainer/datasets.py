@@ -98,6 +98,8 @@ class DatasetManager:
                     {
                         "path": str(path),
                         "digest": item.digest,
+                        "artifactDigest": item.artifact_digest,
+                        "logicalPath": item.logical_path,
                         "records": len(records),
                         "datasetId": manifest.metadata.id,
                         "split": item.split,
@@ -175,7 +177,7 @@ class DatasetManager:
                 status=409,
             )
         if entry.get("kind") == "file":
-            return Path(entry["objectPath"]).resolve()
+            return Path(entry.get("checkoutPath") or entry.get("objectPath", "")).resolve()
         logical = item.logical_path
         if not logical:
             raise TrainerError(
@@ -185,7 +187,9 @@ class DatasetManager:
             )
         for file in entry.get("files", []):
             if file.get("path") == logical:
-                return Path(file["objectPath"]).resolve()
+                return Path(
+                    file.get("checkoutPath") or file.get("objectPath", "")
+                ).resolve()
         raise TrainerError(
             f"Artifact {digest} has no logical path {logical}",
             code="dataset_logical_path_not_found",

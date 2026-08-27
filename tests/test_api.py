@@ -1,0 +1,58 @@
+from __future__ import annotations
+
+import hashlib
+import json
+from pathlib import Path
+
+from fastapi.testclient import TestClient
+
+from jester_trainer.api import create_app
+from jester_trainer.config import Settings
+from jester_trainer.service import TrainerService
+
+
+def test_api_auth_and_dataset_idempotency(tmp_path: Path) -> None:
+    data = tmp_path / "train.jsonl"
+    data.write_text(
+        json.dumps({"id": "one", "semanticCaseId": "case-one", "text": "hello"})
+        + "\n",
+        encoding="utf-8",
+    )
+    digest = hashlib.sha256(data.read_bytes()).hexdigest()
+    service = TrainerService(Settings.for_test(tmp_path / "trainer"))
+    headers = {
+        "Authorization": f"Bearer {service.token}",
+        "Idempotency-Key": "register-dataset-once",
+    }
+    with TestClient(create_app(service)) as client:
+        assert client.get("/v1/health").status_code == 200
+        assert client.get("/v1/datasets").status_code == 401
+        payload = {
+            "apiVersion": "jester.trainer/v1",
+            "kind": "DatasetManifest",
+            "metadata": {"id": "tiny-dataset"},
+            "files": [
+                {
+                    "split": "train",
+                    "digest": f"sha256:{digest}",
+                    "path": str(data),
+                    "records": 1,
+                }
+            ],
+        }
+        first = client.post("/v1/datasets", headers=headers, json=payload)
+        second = client.post("/v1/datasets", headers=headers, json=payload)
+        assert first.status_code == 201
+        assert second.status_code == 201
+        assert first.json() == second.json()
+        changed = {**payload, "seed": 99}
+        conflict = client.post("/v1/datasets", headers=headers, json=changed)
+        assert conflict.status_code == 409
+        assert conflict.json()["code"] == "idempotency_conflict"
+        listed = client.get(
+            "/v1/datasets", headers={"Authorization": f"Bearer {service.token}"}
+        )
+        assert listed.status_code == 200
+        assert [item["metadata"]["id"] for item in listed.json()["items"]] == [
+            "tiny-dataset"
+        ]

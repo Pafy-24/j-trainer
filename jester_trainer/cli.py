@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import typer
+from safetensors.torch import load_file, save_file
 
 from .config import Settings
 from .errors import TrainerError
@@ -373,6 +374,60 @@ def migrate_mi_config(
             "previousDevice": previous_device,
             "device": "managed",
             "removedFromMI": ["optimizer", "scheduler", "job lifecycle"],
+        }
+    )
+
+
+@app.command("migrate-mi-checkpoint")
+def migrate_mi_checkpoint(source: Path, output: Path) -> None:
+    """Convert legacy MI facet weights into Trainer initial child weights.
+
+    Optimizer/scheduler state is intentionally not claimed compatible; the
+    migrated file is used through checkpoint.initialWeights.
+    """
+    source = source.expanduser().resolve()
+    weights = source / "facet.safetensors" if source.is_dir() else source
+    if not weights.is_file():
+        raise TrainerError(
+            f"Legacy facet weights are missing: {weights}",
+            code="legacy_checkpoint_incomplete",
+            status=404,
+        )
+    state = load_file(str(weights), device="cpu")
+    converted = {}
+    import re
+
+    pattern = re.compile(r"^slots\.([^.]+)\.blocks\.(\d{4})\.(.+)$")
+    for name, tensor in state.items():
+        match = pattern.match(name)
+        if not match:
+            raise TrainerError(
+                f"Legacy tensor name cannot be migrated: {name}",
+                code="legacy_checkpoint_tensor_name",
+                status=422,
+            )
+        slot, block, remainder = match.groups()
+        converted[f"{slot}.{int(block)}.{remainder}"] = tensor.contiguous()
+    output = output.expanduser().resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    save_file(converted, str(output))
+    atomic_write_json(
+        output.with_suffix(output.suffix + ".migration.json"),
+        {
+            "schemaVersion": "jester-trainer-checkpoint-migration-v1",
+            "source": str(weights),
+            "initialWeights": str(output),
+            "tensorCount": len(converted),
+            "optimizerStateMigrated": False,
+            "schedulerStateMigrated": False,
+        },
+    )
+    _print(
+        {
+            "migrated": True,
+            "initialWeights": str(output),
+            "configure": {"checkpoint": {"initialWeights": str(output)}},
+            "warning": "optimizer and scheduler restart from campaign configuration",
         }
     )
 

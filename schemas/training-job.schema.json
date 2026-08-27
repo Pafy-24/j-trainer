@@ -1,0 +1,113 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "apiVersion": {
+      "const": "jester.trainer/v1",
+      "default": "jester.trainer/v1",
+      "title": "Apiversion",
+      "type": "string"
+    },
+    "kind": {
+      "const": "TrainingJob",
+      "default": "TrainingJob",
+      "title": "Kind",
+      "type": "string"
+    },
+    "jobId": {
+      "title": "Jobid",
+      "type": "string"
+    },
+    "campaignId": {
+      "title": "Campaignid",
+      "type": "string"
+    },
+    "facetId": {
+      "title": "Facetid",
+      "type": "string"
+    },
+    "candidateId": {
+      "title": "Candidateid",
+      "type": "string"
+    },
+    "dependsOn": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Dependson",
+      "type": "array"
+    },
+    "state": {
+      "default": "queued",
+      "enum": [
+        "queued",
+        "preparing",
+        "running",
+        "succeeded",
+        "failed",
+        "cancelled"
+      ],
+      "title": "State",
+      "type": "string"
+    },
+    "workerIds": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Workerids",
+      "type": "array"
+    },
+    "attempt": {
+      "default": 0,
+      "title": "Attempt",
+      "type": "integer"
+    },
+    "resultId": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Resultid"
+    },
+    "error": {
+      "anyOf": [
+        {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Error"
+    },
+    "generation": {
+      "default": 1,
+      "minimum": 1,
+      "title": "Generation",
+      "type": "integer"
+    },
+    "createdAt": {
+      "title": "Createdat",
+      "type": "string"
+    },
+    "updatedAt": {
+      "title": "Updatedat",
+      "type": "string"
+    }
+  },
+  "required": [
+    "jobId",
+    "campaignId",
+    "facetId",
+    "candidateId"
+  ],
+  "title": "TrainingJob",
+  "type": "object",
+  "$id": "https://jester.local/schemas/trainer/v1/training-job.schema.json"
+}

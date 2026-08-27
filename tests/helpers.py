@@ -12,7 +12,18 @@ from safetensors.torch import load_file
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
-from transformers import LlamaConfig, LlamaForCausalLM, PreTrainedTokenizerFast
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    LlamaConfig,
+    LlamaForCausalLM,
+    PreTrainedTokenizerFast,
+)
+
+# Resolve Transformers' lazy Auto* imports on the main test thread. The real
+# deployment uses one process per worker; the in-process two-worker harness
+# would otherwise race native optional-dependency imports on Windows.
+_ = AutoModelForCausalLM.from_pretrained, AutoTokenizer.from_pretrained
 
 from jester_trainer.config import Settings
 from jester_trainer.models import Campaign, DatasetManifest
@@ -115,7 +126,7 @@ def worker_topology(root: Path, count: int = 2) -> Iterator[dict]:
                     "channelId": f"trainer-to-{worker_id}",
                     "sourceNodeId": "trainer",
                     "destinationNodeId": worker_id,
-                    "protocol": "mi-worker-v1",
+                    "protocol": "http-json+binary",
                     "transport": "local-loopback",
                     "endpoint": {"host": "127.0.0.1", "port": server.server_port},
                     "state": "active",

@@ -1,0 +1,157 @@
+{
+  "$defs": {
+    "RoundContribution": {
+      "additionalProperties": false,
+      "properties": {
+        "workerId": {
+          "title": "Workerid",
+          "type": "string"
+        },
+        "gradientSha256": {
+          "title": "Gradientsha256",
+          "type": "string"
+        },
+        "supervisedTokens": {
+          "exclusiveMinimum": 0,
+          "title": "Supervisedtokens",
+          "type": "integer"
+        },
+        "examples": {
+          "exclusiveMinimum": 0,
+          "title": "Examples",
+          "type": "integer"
+        },
+        "meanLoss": {
+          "title": "Meanloss",
+          "type": "number"
+        }
+      },
+      "required": [
+        "workerId",
+        "gradientSha256",
+        "supervisedTokens",
+        "examples",
+        "meanLoss"
+      ],
+      "title": "RoundContribution",
+      "type": "object"
+    },
+    "RoundState": {
+      "enum": [
+        "preparing",
+        "collecting",
+        "committed",
+        "aborted"
+      ],
+      "title": "RoundState",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "apiVersion": {
+      "const": "jester.trainer/v1",
+      "default": "jester.trainer/v1",
+      "title": "Apiversion",
+      "type": "string"
+    },
+    "kind": {
+      "const": "TrainingRound",
+      "default": "TrainingRound",
+      "title": "Kind",
+      "type": "string"
+    },
+    "roundId": {
+      "title": "Roundid",
+      "type": "string"
+    },
+    "attemptId": {
+      "title": "Attemptid",
+      "type": "string"
+    },
+    "index": {
+      "minimum": 0,
+      "title": "Index",
+      "type": "integer"
+    },
+    "state": {
+      "$ref": "#/$defs/RoundState",
+      "default": "preparing"
+    },
+    "weightVersion": {
+      "title": "Weightversion",
+      "type": "string"
+    },
+    "contributions": {
+      "items": {
+        "$ref": "#/$defs/RoundContribution"
+      },
+      "title": "Contributions",
+      "type": "array"
+    },
+    "aggregateSha256": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Aggregatesha256"
+    },
+    "startedAt": {
+      "title": "Startedat",
+      "type": "string"
+    },
+    "committedAt": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Committedat"
+    },
+    "error": {
+      "anyOf": [
+        {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Error"
+    },
+    "generation": {
+      "default": 1,
+      "minimum": 1,
+      "title": "Generation",
+      "type": "integer"
+    },
+    "createdAt": {
+      "title": "Createdat",
+      "type": "string"
+    },
+    "updatedAt": {
+      "title": "Updatedat",
+      "type": "string"
+    }
+  },
+  "required": [
+    "roundId",
+    "attemptId",
+    "index",
+    "weightVersion"
+  ],
+  "title": "TrainingRound",
+  "type": "object",
+  "$id": "https://jester.local/schemas/trainer/v1/training-round.schema.json"
+}

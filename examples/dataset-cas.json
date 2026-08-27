@@ -1,0 +1,17 @@
+{
+  "apiVersion": "jester.trainer/v1",
+  "kind": "DatasetManifest",
+  "metadata": {
+    "id": "coder-data-v1",
+    "displayName": "Coder training data"
+  },
+  "files": [
+    {
+      "split": "train",
+      "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "artifactDigest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "logicalPath": "training.jsonl"
+    }
+  ],
+  "semanticCaseIdField": "semanticCaseId"
+}

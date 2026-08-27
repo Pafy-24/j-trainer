@@ -21,19 +21,30 @@ class RMScopedClient:
         return bool(self.base_url and self.credential and self.topology_id)
 
     def get(self, path: str) -> dict[str, Any]:
+        return self.request("GET", path)
+
+    def request(
+        self, method: str, path: str, payload: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         if not self.available:
             raise TrainerError(
                 "RM service grant is unavailable in the topology context",
                 code="rm_service_grant_unavailable",
                 status=409,
             )
+        data = None
+        headers = {
+            "Authorization": f"Bearer {self.credential}",
+            "Accept": "application/json",
+        }
+        if payload is not None:
+            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            headers["Content-Type"] = "application/json"
         request = urllib.request.Request(
             self.base_url + path,
-            method="GET",
-            headers={
-                "Authorization": f"Bearer {self.credential}",
-                "Accept": "application/json",
-            },
+            data=data,
+            method=method,
+            headers=headers,
         )
         try:
             with urllib.request.urlopen(request, timeout=30) as response:
@@ -72,4 +83,11 @@ class RMScopedClient:
     def effective_config(self) -> dict[str, Any]:
         return self.get(
             f"/v1/topologies/{self.topology_id}/effective-config"
+        )
+
+    def publish_artifact(self, relative_path: str) -> dict[str, Any]:
+        return self.request(
+            "POST",
+            f"/v1/topologies/{self.topology_id}/artifacts/publish",
+            {"relativePath": relative_path},
         )

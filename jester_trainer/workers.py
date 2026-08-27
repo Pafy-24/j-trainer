@@ -22,6 +22,7 @@ class WorkerDescriptor:
     base_url: str
     transport: str
     channel_id: str
+    protocol: str
     resumable: bool
     requested_backend: str = "cpu"
     effective_backend: str = "cpu"
@@ -35,6 +36,7 @@ class WorkerDescriptor:
             "baseUrl": self.base_url,
             "transport": self.transport,
             "channelId": self.channel_id,
+            "protocol": self.protocol,
             "resumable": self.resumable,
             "requestedBackend": self.requested_backend,
             "effectiveBackend": self.effective_backend,
@@ -356,6 +358,7 @@ class WorkerPool:
                 base_url=f"http://127.0.0.1:{port}",
                 transport=str(channel.get("transport", "local-loopback")),
                 channel_id=str(channel.get("channelId", "")),
+                protocol=str(channel.get("protocol", "http-json")),
                 resumable=bool(channel.get("resumable", False)),
                 requested_backend=str(node.get("requestedBackend", "cpu")),
                 effective_backend=str(node.get("effectiveBackend", "cpu")),
@@ -368,7 +371,13 @@ class WorkerPool:
             for worker_id, descriptor in descriptors.items()
         }
 
-    def select(self, worker_ids: list[str], size: int | None) -> list[WorkerClient]:
+    def select(
+        self,
+        worker_ids: list[str],
+        size: int | None,
+        *,
+        retain_pool: bool = False,
+    ) -> list[WorkerClient]:
         available = sorted(self.clients)
         selected = worker_ids or available
         missing = sorted(set(selected).difference(self.clients))
@@ -384,6 +393,8 @@ class WorkerPool:
                 f"Cohort size {size} exceeds available pool size {len(selected)}",
                 code="cohort_too_large",
             )
+        if size is not None and not retain_pool:
+            selected = selected[:size]
         return [self.clients[item] for item in selected]
 
     def status(self) -> list[dict[str, Any]]:

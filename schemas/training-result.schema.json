@@ -1,0 +1,88 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "apiVersion": {
+      "const": "jester.trainer/v1",
+      "default": "jester.trainer/v1",
+      "title": "Apiversion",
+      "type": "string"
+    },
+    "kind": {
+      "const": "TrainingResult",
+      "default": "TrainingResult",
+      "title": "Kind",
+      "type": "string"
+    },
+    "resultId": {
+      "title": "Resultid",
+      "type": "string"
+    },
+    "campaignId": {
+      "title": "Campaignid",
+      "type": "string"
+    },
+    "jobId": {
+      "title": "Jobid",
+      "type": "string"
+    },
+    "facetReference": {
+      "title": "Facetreference",
+      "type": "string"
+    },
+    "artifactPath": {
+      "title": "Artifactpath",
+      "type": "string"
+    },
+    "artifactSha256": {
+      "title": "Artifactsha256",
+      "type": "string"
+    },
+    "artifactDigest": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Artifactdigest"
+    },
+    "metrics": {
+      "additionalProperties": true,
+      "title": "Metrics",
+      "type": "object"
+    },
+    "promoted": {
+      "default": false,
+      "title": "Promoted",
+      "type": "boolean"
+    },
+    "generation": {
+      "default": 1,
+      "minimum": 1,
+      "title": "Generation",
+      "type": "integer"
+    },
+    "createdAt": {
+      "title": "Createdat",
+      "type": "string"
+    },
+    "updatedAt": {
+      "title": "Updatedat",
+      "type": "string"
+    }
+  },
+  "required": [
+    "resultId",
+    "campaignId",
+    "jobId",
+    "facetReference",
+    "artifactPath",
+    "artifactSha256"
+  ],
+  "title": "TrainingResult",
+  "type": "object",
+  "$id": "https://jester.local/schemas/trainer/v1/training-result.schema.json"
+}
