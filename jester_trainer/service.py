@@ -225,7 +225,13 @@ class TrainerService:
                 "Campaign topologyId differs from the Trainer RM lease",
                 code="campaign_topology_mismatch",
             )
-        for use in campaign.spec.datasets:
+        declared_uses = list(campaign.spec.datasets)
+        declared_uses.extend(
+            use for facet in campaign.spec.facets for use in facet.datasets
+        )
+        for use in {
+            (item.dataset_id, item.split): item for item in declared_uses
+        }.values():
             self.get_dataset(use.dataset_id)
         if self.rm.available:
             campaign = campaign.model_copy(deep=True)
@@ -284,9 +290,16 @@ class TrainerService:
 
     def plan_campaign(self, campaign_id: str) -> dict[str, Any]:
         campaign = self.get_campaign(campaign_id)
+        dataset_uses = list(campaign.spec.datasets)
+        dataset_uses.extend(
+            use for facet in campaign.spec.facets for use in facet.datasets
+        )
+        unique_uses = {
+            (use.dataset_id, use.split): use for use in dataset_uses
+        }
         manifests = [
             (self.get_dataset(use.dataset_id), use)
-            for use in campaign.spec.datasets
+            for use in unique_uses.values()
         ]
         for manifest, _ in manifests:
             self.datasets.validate(manifest)
@@ -681,17 +694,18 @@ class TrainerService:
         attempt = TrainingAttempt.model_validate(
             self.store.put_entity("attempt", attempt_id, attempt.api_dict())
         )
+        facet = next(
+            item for item in campaign.spec.facets if item.id == job.facet_id
+        )
+        dataset_uses = _facet_dataset_uses(campaign, job.facet_id)
         manifests = [
             (self.get_dataset(use.dataset_id), use)
-            for use in campaign.spec.datasets
+            for use in dataset_uses
         ]
         shard_plan = self.datasets.shard_plan(
             manifests,
             [item.descriptor.worker_id for item in workers],
             seed=campaign.spec.training.seed,
-        )
-        facet = next(
-            item for item in campaign.spec.facets if item.id == job.facet_id
         )
         candidate = next(
             item for item in facet.candidates if item.id == job.candidate_id
@@ -1127,6 +1141,17 @@ class TrainerService:
                     recovering.api_dict(),
                     expected_generation=campaign.generation,
                 )
+
+
+def _facet_dataset_uses(campaign: Campaign, facet_id: str) -> list[Any]:
+    facet = next((item for item in campaign.spec.facets if item.id == facet_id), None)
+    if facet is None:
+        raise TrainerError(
+            f"Campaign has no facet node {facet_id}",
+            code="facet_not_found",
+            status=422,
+        )
+    return list(facet.datasets or campaign.spec.datasets)
 
 
 def _deep_merge(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:

@@ -74,6 +74,19 @@ class DatasetManager:
     ) -> dict[str, Any]:
         if not worker_ids:
             raise ConflictError("Cannot shard a dataset over an empty cohort")
+        weighted = [
+            {"datasetId": use.dataset_id, "split": use.split, "weight": use.weight}
+            for _, use in manifests
+            if use.weight != 1.0
+        ]
+        if weighted:
+            raise TrainerError(
+                "DatasetUse.weight is not implemented by the deterministic shard planner; "
+                "use weight=1 until weighted sampling has a versioned policy",
+                code="dataset_weight_unsupported",
+                status=422,
+                fields={"datasetUses": weighted},
+            )
         assignments: dict[str, list[int]] = {worker_id: [] for worker_id in worker_ids}
         semantic_groups: dict[str, list[int]] = {}
         sources: list[dict[str, Any]] = []

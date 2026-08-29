@@ -135,6 +135,7 @@ class CandidateSpec(APIModel):
 class FacetNodeSpec(APIModel):
     id: str
     depends_on: list[str] = Field(default_factory=list, alias="dependsOn")
+    datasets: list[DatasetUse] = Field(default_factory=list)
     mi_config: dict[str, Any] = Field(alias="miConfig")
     candidates: list[CandidateSpec] = Field(default_factory=list)
 
@@ -150,6 +151,11 @@ class FacetNodeSpec(APIModel):
         candidate_ids = [candidate.id for candidate in self.candidates]
         if len(candidate_ids) != len(set(candidate_ids)):
             raise ValueError(f"facet {self.id} candidate IDs must be unique")
+        dataset_keys = [(item.dataset_id, item.split) for item in self.datasets]
+        if len(dataset_keys) != len(set(dataset_keys)):
+            raise ValueError(
+                f"facet {self.id} dataset uses must be unique by datasetId and split"
+            )
         return self
 
 
@@ -222,10 +228,16 @@ class CampaignSpec(APIModel):
 
     @model_validator(mode="after")
     def validate_dag(self) -> "CampaignSpec":
-        if not self.datasets:
-            raise ValueError("campaign requires at least one dataset")
         if not self.facets:
             raise ValueError("campaign requires at least one facet node")
+        missing_datasets = [
+            facet.id for facet in self.facets if not facet.datasets and not self.datasets
+        ]
+        if missing_datasets:
+            raise ValueError(
+                "every facet requires datasets or a campaign-level dataset fallback: "
+                f"{missing_datasets}"
+            )
         ids = [facet.id for facet in self.facets]
         if len(ids) != len(set(ids)):
             raise ValueError("campaign facet IDs must be unique")

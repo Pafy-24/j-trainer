@@ -2446,6 +2446,13 @@
             "type": "array",
             "title": "Dependson"
           },
+          "datasets": {
+            "items": {
+              "$ref": "#/components/schemas/DatasetUse"
+            },
+            "type": "array",
+            "title": "Datasets"
+          },
           "miConfig": {
             "additionalProperties": true,
             "type": "object",

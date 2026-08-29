@@ -234,6 +234,13 @@
           "title": "Dependson",
           "type": "array"
         },
+        "datasets": {
+          "items": {
+            "$ref": "#/$defs/DatasetUse"
+          },
+          "title": "Datasets",
+          "type": "array"
+        },
         "miConfig": {
           "additionalProperties": true,
           "title": "Miconfig",

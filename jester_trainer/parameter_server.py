@@ -94,7 +94,10 @@ class ParameterServer:
             expected_sha256=str(first_summary["weightSha256"]),
             compression=self.campaign.spec.training.compression,
         )
-        self._initialize_parameters(initial_path)
+        try:
+            self._initialize_parameters(initial_path)
+        finally:
+            initial_path.unlink(missing_ok=True)
         self._build_optimizer()
         self._resume_if_requested()
         current_path = self._save_coordinator_weights(self.current_version)
@@ -144,6 +147,7 @@ class ParameterServer:
                 )
                 gradient_norm = self._apply_update(aggregate)
                 next_version = f"r{round_index + 1:08d}"
+                previous_path = current_path
                 current_path = self._save_coordinator_weights(next_version)
                 self.current_version = next_version
                 self.losses.append(
@@ -185,6 +189,7 @@ class ParameterServer:
                 ):
                     self._checkpoint(round_index + 1, current_path)
                 self._ack_rounds(round_index, contributions)
+                self._cleanup_downloaded_gradients(gradients)
                 self.emit(
                     "ROUND_COMMITTED",
                     campaign_id=self.campaign.metadata.id,
@@ -199,6 +204,8 @@ class ParameterServer:
                 )
                 if round_index + 1 < self.campaign.spec.training.max_steps:
                     self._publish_weights(current_path, self.current_version)
+                if previous_path != current_path:
+                    previous_path.unlink(missing_ok=True)
             except BaseException as exc:
                 aborted = round_model.model_copy(
                     update={
@@ -219,9 +226,13 @@ class ParameterServer:
 
         final_weights = self._save_coordinator_weights("final")
         metrics = self._metrics()
-        artifact_path, digest, reference = self._write_mi_artifact(
-            final_weights, metrics
-        )
+        try:
+            artifact_path, digest, reference = self._write_mi_artifact(
+                final_weights, metrics
+            )
+        finally:
+            final_weights.unlink(missing_ok=True)
+            current_path.unlink(missing_ok=True)
         return ParameterServerResult(
             artifact_path=artifact_path,
             artifact_sha256=digest,
@@ -559,19 +570,61 @@ class ParameterServer:
         return path
 
     def _publish_weights(self, path: Path, version: str) -> None:
-        with ThreadPoolExecutor(max_workers=len(self.workers)) as executor:
-            futures = {
-                executor.submit(
-                    worker.upload_weights,
-                    self.session_ids[worker.descriptor.worker_id],
-                    version,
-                    path,
-                    compression=self.campaign.spec.training.compression,
-                ): worker.descriptor.worker_id
-                for worker in self.workers
-            }
-            for future in as_completed(futures):
-                future.result()
+        transport_path = self._transport_weight_path(path)
+        try:
+            with ThreadPoolExecutor(max_workers=len(self.workers)) as executor:
+                futures = {
+                    executor.submit(
+                        worker.upload_weights,
+                        self.session_ids[worker.descriptor.worker_id],
+                        version,
+                        transport_path,
+                        compression=self.campaign.spec.training.compression,
+                    ): worker.descriptor.worker_id
+                    for worker in self.workers
+                }
+                for future in as_completed(futures):
+                    future.result()
+        finally:
+            if transport_path != path:
+                transport_path.unlink(missing_ok=True)
+                transport_path.with_suffix(transport_path.suffix + ".zst").unlink(
+                    missing_ok=True
+                )
+
+    def _transport_weight_path(self, path: Path) -> Path:
+        dtype_name = self.campaign.spec.training.transport_dtype
+        if dtype_name == "float32":
+            return path
+        target_dtype = {
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+        }.get(dtype_name)
+        if target_dtype is None:
+            raise TrainerError(
+                f"Unsupported weight transport dtype: {dtype_name}",
+                code="unsupported_transport_dtype",
+                status=422,
+            )
+        state = load_file(str(path), device="cpu")
+        destination = path.with_name(f"{path.stem}.{dtype_name}{path.suffix}")
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
+        )
+        os.close(descriptor)
+        temporary = Path(temporary_name)
+        try:
+            save_file(
+                {
+                    name: tensor.to(dtype=target_dtype).contiguous()
+                    for name, tensor in state.items()
+                },
+                str(temporary),
+            )
+            os.replace(temporary, destination)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return destination
 
     def _ack_rounds(
         self, round_index: int, contributions: list[RoundContribution]
@@ -584,6 +637,19 @@ class ParameterServer:
                 f"/v1/sessions/{self.session_ids[worker_id]}/rounds/{round_index}/ack",
                 {"gradientSha256": by_worker[worker_id].gradient_sha256},
             )
+
+    @staticmethod
+    def _cleanup_downloaded_gradients(paths: dict[str, Path]) -> None:
+        parents: set[Path] = set()
+        for path in paths.values():
+            path.unlink(missing_ok=True)
+            path.with_suffix(path.suffix + ".zst").unlink(missing_ok=True)
+            parents.add(path.parent)
+        for parent in parents:
+            try:
+                parent.rmdir()
+            except OSError:
+                pass
 
     def _checkpoint(self, next_round: int, weights_path: Path) -> Path:
         assert self.optimizer is not None and self.scheduler is not None
