@@ -34,19 +34,20 @@ class DatasetManager:
                     code="dataset_hash_mismatch",
                     status=409,
                 )
-            records = list(self._records(path))
+            records = list(self._records(path, logical_path=item.logical_path))
             for index, record in enumerate(records):
                 semantic = self._semantic_id(
                     record, manifest.semantic_case_id_field, path, index
                 )
                 semantic_cases.add(semantic)
             total += len(records)
-            if item.split != "test" and path.name.lower() in {
+            logical_name = Path(item.logical_path or path.name).name.lower()
+            if item.split != "test" and logical_name in {
                 "test.json",
                 "test.jsonl",
             }:
                 warnings.append(
-                    f"{path.name} is marked {item.split}; it will still be rejected as a gradient source"
+                    f"{logical_name} is marked {item.split}; it will still be rejected as a gradient source"
                 )
             files.append(
                 {
@@ -97,7 +98,8 @@ class DatasetManager:
                 if item.split != use.split:
                     continue
                 path = self.resolve(item)
-                if item.split == "test" or path.name.lower() in {
+                logical_name = Path(item.logical_path or path.name).name.lower()
+                if item.split == "test" or logical_name in {
                     "test.json",
                     "test.jsonl",
                 }:
@@ -106,7 +108,7 @@ class DatasetManager:
                         code="test_split_gradient_forbidden",
                         status=422,
                     )
-                records = list(self._records(path))
+                records = list(self._records(path, logical_path=item.logical_path))
                 sources.append(
                     {
                         "path": str(path),
@@ -228,8 +230,11 @@ class DatasetManager:
         }
 
     @staticmethod
-    def _records(path: Path) -> Iterable[dict[str, Any]]:
-        if path.suffix.lower() == ".jsonl":
+    def _records(
+        path: Path, *, logical_path: str | None = None
+    ) -> Iterable[dict[str, Any]]:
+        format_path = Path(logical_path) if logical_path else path
+        if format_path.suffix.lower() == ".jsonl":
             with path.open("r", encoding="utf-8") as handle:
                 for line_number, line in enumerate(handle, 1):
                     if not line.strip():

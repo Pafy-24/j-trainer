@@ -284,6 +284,9 @@ class ParameterServer:
         base_digest = base.pop("artifactDigest", None)
         base_logical = base.pop("artifactLogicalPath", None)
         if base_digest:
+            # Preserve an identity that is stable across the remote CAS
+            # checkout and a later local checkout of the exact same model.
+            base.setdefault("canonicalId", base_digest)
             bindings.append(
                 {
                     "target": "/baseModel/id",
@@ -304,7 +307,10 @@ class ParameterServer:
         data = config.setdefault("data", {})
         data["train"] = []
         for index, source in enumerate(self.shard_plan["sources"]):
-            data["train"].append({"path": source["path"]})
+            source_config = {"path": source["path"]}
+            if source.get("logicalPath"):
+                source_config["logicalPath"] = source["logicalPath"]
+            data["train"].append(source_config)
             if source.get("artifactDigest"):
                 bindings.append(
                     {
@@ -679,6 +685,7 @@ class ParameterServer:
                         source["digest"] for source in self.shard_plan["sources"]
                     ],
                     "lastConfirmedRound": next_round - 1,
+                    "metrics": self._checkpoint_metrics(),
                 },
                 temporary / "trainer-state.pt",
             )
@@ -762,6 +769,56 @@ class ParameterServer:
             )
         self.start_round = int(state["nextRound"])
         self.current_version = str(state["weightVersion"])
+        self._restore_checkpoint_metrics(state)
+
+    def _checkpoint_metrics(self) -> dict[str, Any]:
+        return {
+            "losses": list(self.losses),
+            "roundDurations": list(self.round_durations),
+            "workerWaitSeconds": dict(self.worker_wait_seconds),
+            "supervisedTokens": self.total_supervised_tokens,
+        }
+
+    def _restore_checkpoint_metrics(self, state: dict[str, Any]) -> None:
+        """Restore cumulative metrics without breaking legacy v1 checkpoints."""
+
+        raw = state.get("metrics")
+        if raw is None:
+            return
+        if not isinstance(raw, dict):
+            raise ConflictError(
+                "Checkpoint metrics state is invalid",
+                code="checkpoint_metrics_invalid",
+            )
+        try:
+            losses = [float(item) for item in raw["losses"]]
+            durations = [float(item) for item in raw["roundDurations"]]
+            waits = {
+                str(worker_id): float(value)
+                for worker_id, value in raw["workerWaitSeconds"].items()
+            }
+            supervised_tokens = int(raw["supervisedTokens"])
+        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+            raise ConflictError(
+                "Checkpoint metrics state is invalid",
+                code="checkpoint_metrics_invalid",
+            ) from exc
+        if (
+            len(losses) != len(durations)
+            or len(losses) != self.start_round
+            or any(duration < 0 for duration in durations)
+            or any(value < 0 for value in waits.values())
+            or supervised_tokens < 0
+            or set(waits) != set(self.worker_wait_seconds)
+        ):
+            raise ConflictError(
+                "Checkpoint metrics do not match the confirmed rounds or cohort",
+                code="checkpoint_metrics_invalid",
+            )
+        self.losses = losses
+        self.round_durations = durations
+        self.worker_wait_seconds = waits
+        self.total_supervised_tokens = supervised_tokens
 
     def _write_mi_artifact(
         self, weights_path: Path, metrics: dict[str, Any]

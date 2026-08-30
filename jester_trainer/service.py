@@ -312,7 +312,10 @@ class TrainerService:
         existing = self.campaign_jobs(campaign_id)
         if existing and campaign.state == CampaignState.PLANNED:
             return self._campaign_plan_payload(campaign, existing, workers)
-        jobs = self._expand_jobs(campaign)
+        jobs = _carry_forward_job_attempts(
+            self._expand_jobs(campaign),
+            existing,
+        )
         for job in jobs:
             self.store.put_entity("job", job.job_id, job.api_dict())
         planned = campaign.model_copy(
@@ -610,7 +613,11 @@ class TrainerService:
         job: TrainingJob,
         workers: list[WorkerClient],
     ) -> TrainingResult:
-        maximum = campaign.spec.checkpoint.max_retries + 1
+        # A manual retry starts a new retry window while preserving the
+        # monotonic attempt number for audit/recovery.  Using only
+        # maxRetries+1 made an exhausted job execute an empty range and hit
+        # the assertion below immediately.
+        maximum = job.attempt + campaign.spec.checkpoint.max_retries + 1
         last_error: BaseException | None = None
         for attempt_number in range(job.attempt + 1, maximum + 1):
             self._control_point(campaign.metadata.id)
@@ -787,6 +794,37 @@ class TrainerService:
                 data={"resultId": result_id, "facet": result.facet_reference},
             )
             return stored_result
+        except BaseException as exc:
+            # Keep attempt audit state truthful even when session creation,
+            # model loading, a round, or artifact publication fails.  Leaving
+            # exhausted attempts as ``running`` makes recovery and benchmark
+            # provenance ambiguous after the enclosing job is already failed.
+            try:
+                current_attempt = TrainingAttempt.model_validate(
+                    self.store.get_entity("attempt", attempt_id)
+                )
+                if current_attempt.state == "running":
+                    failed_attempt = current_attempt.model_copy(
+                        update={
+                            "state": "failed",
+                            "completed_at": utc_now(),
+                            "error": {
+                                "code": getattr(exc, "code", "job_failed"),
+                                "detail": f"{type(exc).__name__}: {exc}",
+                            },
+                        }
+                    )
+                    self.store.put_entity(
+                        "attempt",
+                        attempt_id,
+                        failed_attempt.api_dict(),
+                        expected_generation=current_attempt.generation,
+                    )
+            except BaseException:
+                # Never replace the actual training failure with a secondary
+                # audit-write failure; the job/campaign handler records it.
+                pass
+            raise
         finally:
             for worker in workers:
                 session_id = server.session_ids.get(worker.descriptor.worker_id)
@@ -1152,6 +1190,30 @@ def _facet_dataset_uses(campaign: Campaign, facet_id: str) -> list[Any]:
             status=422,
         )
     return list(facet.datasets or campaign.spec.datasets)
+
+
+def _carry_forward_job_attempts(
+    jobs: list[TrainingJob],
+    existing: list[dict[str, Any]],
+) -> list[TrainingJob]:
+    """Keep attempt numbers monotonic when a failed campaign is replanned.
+
+    Replanning intentionally rebuilds queued jobs from the current campaign DAG,
+    but resetting ``attempt`` to zero would reuse attempt/checkpoint identifiers
+    that are immutable audit records.  Only the monotonic counter is inherited;
+    state, dependencies, errors and result references still come from the newly
+    expanded plan.
+    """
+
+    attempts = {
+        previous.job_id: previous.attempt
+        for payload in existing
+        for previous in [TrainingJob.model_validate(payload)]
+    }
+    return [
+        job.model_copy(update={"attempt": attempts.get(job.job_id, 0)})
+        for job in jobs
+    ]
 
 
 def _deep_merge(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:

@@ -24,7 +24,12 @@ class RMScopedClient:
         return self.request("GET", path)
 
     def request(
-        self, method: str, path: str, payload: dict[str, Any] | None = None
+        self,
+        method: str,
+        path: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        timeout_seconds: float = 30,
     ) -> dict[str, Any]:
         if not self.available:
             raise TrainerError(
@@ -47,7 +52,7 @@ class RMScopedClient:
             headers=headers,
         )
         try:
-            with urllib.request.urlopen(request, timeout=30) as response:
+            with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
                 value = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             raw = exc.read().decode("utf-8", errors="replace")
@@ -90,4 +95,5 @@ class RMScopedClient:
             "POST",
             f"/v1/topologies/{self.topology_id}/artifacts/publish",
             {"relativePath": relative_path},
+            timeout_seconds=3600,
         )

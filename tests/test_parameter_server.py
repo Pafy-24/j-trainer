@@ -6,6 +6,7 @@ from pathlib import Path
 import torch
 
 from jester_trainer.config import Settings
+from jester_trainer.parameter_server import ParameterServer
 from jester_trainer.service import TrainerService
 
 from .helpers import (
@@ -67,3 +68,54 @@ def test_two_worker_update_matches_combined_single_worker_batch() -> None:
                 assert service.get_campaign("distributed").state == "succeeded"
             finally:
                 service.close()
+
+
+def test_remote_cas_binding_uses_digest_as_portable_base_identity() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        campaign_model = campaign(
+            root,
+            root / "runtime-model-path",
+            campaign_id="portable-identity",
+            version="portable",
+            workers=["worker-1"],
+        )
+        digest = "sha256:" + "c" * 64
+        server = object.__new__(ParameterServer)
+        server.campaign = campaign_model
+        server.mi_config = campaign_model.spec.facets[0].mi_config
+        server.mi_config["baseModel"]["artifactDigest"] = digest
+        server.shard_plan = {"sources": []}
+        server.output = root / "output"
+        server.artifact_bindings = []
+
+        config = server._worker_training_config()
+
+        assert config["baseModel"]["id"] == "rm-artifact-pending"
+        assert config["baseModel"]["canonicalId"] == digest
+        assert server.artifact_bindings[0] == {
+            "target": "/baseModel/id",
+            "digest": digest,
+            "logicalPath": None,
+        }
+
+
+def test_checkpoint_metrics_survive_a_resumed_completed_attempt() -> None:
+    source = object.__new__(ParameterServer)
+    source.losses = [4.5, 4.0]
+    source.round_durations = [2.0, 3.0]
+    source.worker_wait_seconds = {"worker-1": 0.25}
+    source.total_supervised_tokens = 500
+
+    resumed = object.__new__(ParameterServer)
+    resumed.start_round = 2
+    resumed.losses = []
+    resumed.round_durations = []
+    resumed.worker_wait_seconds = {"worker-1": 0.0}
+    resumed.total_supervised_tokens = 0
+    resumed._restore_checkpoint_metrics({"metrics": source._checkpoint_metrics()})
+
+    assert resumed.losses == [4.5, 4.0]
+    assert resumed.round_durations == [2.0, 3.0]
+    assert resumed.worker_wait_seconds == {"worker-1": 0.25}
+    assert resumed.total_supervised_tokens == 500
