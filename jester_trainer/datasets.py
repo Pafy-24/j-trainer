@@ -164,10 +164,28 @@ class DatasetManager:
             assignments[owner[group_key]].extend(indices)
         for values in assignments.values():
             values.sort()
+        global_groups = [
+            {
+                "semanticCaseId": group_key,
+                "indices": sorted(semantic_groups[group_key]),
+                "selectionSha256": hashlib.sha256(
+                    f"{seed}:{group_key}".encode("utf-8")
+                ).hexdigest(),
+            }
+            for group_key in sorted(
+                semantic_groups,
+                key=lambda item: (
+                    hashlib.sha256(f"{seed}:{item}".encode("utf-8")).hexdigest(),
+                    item,
+                ),
+            )
+        ]
         return {
-            "schemaVersion": "jester-trainer-shard-plan-v1",
+            "schemaVersion": "jester-trainer-shard-plan-v2",
             "seed": seed,
             "workers": assignments,
+            "globalSemanticGroups": global_groups,
+            "roundSelectionPolicy": "cohort-invariant-semantic-groups-v1",
             "sources": sources,
             "records": selected_records,
             "semanticCases": len(semantic_groups),

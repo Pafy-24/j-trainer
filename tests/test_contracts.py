@@ -60,12 +60,19 @@ def test_semantic_variants_never_cross_deterministic_shards() -> None:
             seed=17,
         )
         assert first == second
+        assert first["schemaVersion"] == "jester-trainer-shard-plan-v2"
+        assert first["roundSelectionPolicy"] == "cohort-invariant-semantic-groups-v1"
         owners = {
             index: worker
             for worker, indices in first["workers"].items()
             for index in indices
         }
         assert owners[0] == owners[1]
+        grouped = {
+            item["semanticCaseId"]: item["indices"]
+            for item in first["globalSemanticGroups"]
+        }
+        assert grouped["train:a"] == [0, 1]
 
 
 def test_test_jsonl_is_never_accepted_as_gradient_source() -> None:

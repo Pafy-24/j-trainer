@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 
@@ -61,6 +63,23 @@ def test_two_worker_update_matches_combined_single_worker_batch() -> None:
                         rtol=2e-5,
                         atol=2e-6,
                     ), name
+                artifact_path = Path(
+                    distributed["result"]["results"][0]["artifactPath"]
+                )
+                manifest = json.loads(
+                    (artifact_path / "facet.mi.json").read_text(encoding="utf-8")
+                )
+                expected_parameters = sum(
+                    int(tensor.numel()) for tensor in distributed_state.values()
+                )
+                assert manifest["artifact"]["parameterCount"] == expected_parameters
+                assert manifest["artifact"]["tensorCount"] == len(distributed_state)
+                assert manifest["artifact"]["sizeBytes"] == (
+                    artifact_path / "facet.safetensors"
+                ).stat().st_size
+                assert sum(
+                    manifest["artifact"]["dtypeParameterCounts"].values()
+                ) == expected_parameters
                 rounds = service.store.list_entities("round")
                 assert len(rounds) == 2
                 assert all(item["state"] == "committed" for item in rounds)
@@ -119,3 +138,51 @@ def test_checkpoint_metrics_survive_a_resumed_completed_attempt() -> None:
     assert resumed.round_durations == [2.0, 3.0]
     assert resumed.worker_wait_seconds == {"worker-1": 0.25}
     assert resumed.total_supervised_tokens == 500
+
+
+def test_global_round_selection_is_identical_across_cohort_sizes() -> None:
+    groups = [
+        {"semanticCaseId": "a", "indices": [0, 1]},
+        {"semanticCaseId": "b", "indices": [2]},
+        {"semanticCaseId": "c", "indices": [3]},
+        {"semanticCaseId": "d", "indices": [4]},
+        {"semanticCaseId": "e", "indices": [5]},
+    ]
+
+    def server(worker_ids: list[str], examples_per_worker: int) -> ParameterServer:
+        value = object.__new__(ParameterServer)
+        value.campaign = SimpleNamespace(
+            spec=SimpleNamespace(
+                training=SimpleNamespace(
+                    examples_per_worker=examples_per_worker,
+                    seed=42,
+                )
+            )
+        )
+        value.workers = [
+            SimpleNamespace(descriptor=SimpleNamespace(worker_id=worker_id))
+            for worker_id in worker_ids
+        ]
+        value.shard_plan = {
+            "globalSemanticGroups": groups,
+            "roundSelectionPolicy": "cohort-invariant-semantic-groups-v1",
+        }
+        return value
+
+    one_assignments, one_hash = server(["one"], 4)._round_indices(0)
+    two_assignments, two_hash = server(["left", "right"], 2)._round_indices(0)
+
+    assert one_hash == two_hash
+    assert sorted(index for values in one_assignments.values() for index in values) == [
+        0,
+        1,
+        2,
+        3,
+    ]
+    assert sorted(index for values in two_assignments.values() for index in values) == [
+        0,
+        1,
+        2,
+        3,
+    ]
+    assert any({0, 1}.issubset(set(values)) for values in two_assignments.values())

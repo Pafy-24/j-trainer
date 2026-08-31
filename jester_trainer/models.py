@@ -322,6 +322,7 @@ class TrainingRound(APIModel):
     index: int = Field(ge=0)
     state: RoundState = RoundState.PREPARING
     weight_version: str = Field(alias="weightVersion")
+    selection_sha256: str | None = Field(default=None, alias="selectionSha256")
     contributions: list[RoundContribution] = Field(default_factory=list)
     aggregate_sha256: str | None = Field(default=None, alias="aggregateSha256")
     started_at: str = Field(default_factory=utc_now, alias="startedAt")

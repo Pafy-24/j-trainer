@@ -108,6 +108,7 @@ class ParameterServer:
         ):
             self.cancel_check()
             started = time.perf_counter()
+            round_assignments, selection_sha256 = self._round_indices(round_index)
             round_id = f"{self.attempt.attempt_id}-r{round_index:08d}"
             round_model = TrainingRound(
                 roundId=round_id,
@@ -115,6 +116,7 @@ class ParameterServer:
                 index=round_index,
                 state=RoundState.PREPARING,
                 weightVersion=self.current_version,
+                selectionSha256=selection_sha256,
             )
             stored_round = self.persist(
                 "round", round_id, round_model.api_dict(), None
@@ -140,7 +142,7 @@ class ParameterServer:
                     )
                 )
                 contributions, gradients, timings = self._collect_round(
-                    round_index
+                    round_index, round_assignments
                 )
                 aggregate, aggregate_sha = self._aggregate(
                     contributions, gradients
@@ -197,6 +199,7 @@ class ParameterServer:
                     round_id=round_id,
                     data={
                         "weightVersion": self.current_version,
+                        "selectionSha256": selection_sha256,
                         "loss": self.losses[-1],
                         "gradientNorm": gradient_norm,
                         "durationSeconds": duration,
@@ -402,25 +405,100 @@ class ParameterServer:
 
         self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, factor)
 
-    def _collect_round(
+    def _round_indices(
         self, round_index: int
-    ) -> tuple[list[RoundContribution], dict[str, Path], dict[str, float]]:
-        examples = self.campaign.spec.training.examples_per_worker
-        requests: dict[Any, tuple[WorkerClient, float]] = {}
-        with ThreadPoolExecutor(max_workers=len(self.workers)) as executor:
-            for worker in self.workers:
-                worker_id = worker.descriptor.worker_id
+    ) -> tuple[dict[str, list[int]], str]:
+        worker_ids = [worker.descriptor.worker_id for worker in self.workers]
+        examples_per_worker = self.campaign.spec.training.examples_per_worker
+        groups = self.shard_plan.get("globalSemanticGroups")
+        if not isinstance(groups, list) or not groups:
+            assignments: dict[str, list[int]] = {}
+            for worker_id in worker_ids:
                 assigned = list(self.shard_plan["workers"].get(worker_id, []))
                 if not assigned:
                     raise ConflictError(
                         f"Worker {worker_id} received an empty deterministic shard",
                         code="empty_worker_shard",
                     )
-                offset = (round_index * examples) % len(assigned)
-                selected = [
+                offset = (round_index * examples_per_worker) % len(assigned)
+                assignments[worker_id] = [
                     assigned[(offset + index) % len(assigned)]
-                    for index in range(min(examples, len(assigned)))
+                    for index in range(min(examples_per_worker, len(assigned)))
                 ]
+            selection = sorted(
+                index for values in assignments.values() for index in values
+            )
+            return assignments, sha256_json(
+                {
+                    "policy": "legacy-worker-shards-v1",
+                    "seed": self.campaign.spec.training.seed,
+                    "round": round_index,
+                    "indices": selection,
+                }
+            )
+
+        if len(groups) < len(worker_ids):
+            raise ConflictError(
+                "Cohort has more workers than independent semantic groups",
+                code="insufficient_semantic_shards",
+            )
+        target = examples_per_worker * len(worker_ids)
+        start = (round_index * target) % len(groups)
+        selected_groups: list[dict[str, Any]] = []
+        selected_count = 0
+        for offset in range(len(groups)):
+            group = groups[(start + offset) % len(groups)]
+            indices = [int(item) for item in group.get("indices", [])]
+            if not indices:
+                raise ConflictError(
+                    "Global semantic shard contains no indices",
+                    code="invalid_global_shard_plan",
+                )
+            selected_groups.append(group)
+            selected_count += len(indices)
+            if selected_count >= target and len(selected_groups) >= len(worker_ids):
+                break
+
+        assignments = {worker_id: [] for worker_id in worker_ids}
+        for group in selected_groups:
+            worker_id = min(
+                worker_ids,
+                key=lambda item: (len(assignments[item]), item),
+            )
+            assignments[worker_id].extend(int(item) for item in group["indices"])
+        empty = [worker_id for worker_id, indices in assignments.items() if not indices]
+        if empty:
+            raise ConflictError(
+                f"Global round selection left workers empty: {empty}",
+                code="empty_worker_shard",
+            )
+        selected_indices = sorted(
+            index for values in assignments.values() for index in values
+        )
+        selection_sha256 = sha256_json(
+            {
+                "policy": self.shard_plan.get("roundSelectionPolicy"),
+                "seed": self.campaign.spec.training.seed,
+                "round": round_index,
+                "targetExamples": target,
+                "indices": selected_indices,
+            }
+        )
+        return assignments, selection_sha256
+
+    def _collect_round(
+        self, round_index: int, assignments: dict[str, list[int]]
+    ) -> tuple[list[RoundContribution], dict[str, Path], dict[str, float]]:
+        requests: dict[Any, tuple[WorkerClient, float]] = {}
+        with ThreadPoolExecutor(max_workers=len(self.workers)) as executor:
+            for worker in self.workers:
+                worker_id = worker.descriptor.worker_id
+                selected = list(assignments.get(worker_id, []))
+                if not selected:
+                    raise ConflictError(
+                        f"Worker {worker_id} received an empty round selection",
+                        code="empty_worker_shard",
+                    )
                 session_id = self.session_ids[worker_id]
                 payload = {
                     "weightVersion": self.current_version,
@@ -850,11 +928,22 @@ class ParameterServer:
         artifact_weights = artifact_root / "facet.safetensors"
         save_file(converted, str(artifact_weights))
         digest = sha256_file(artifact_weights)
+        parameter_count = sum(int(tensor.numel()) for tensor in converted.values())
+        dtype_parameter_counts: dict[str, int] = {}
+        for tensor in converted.values():
+            dtype = str(tensor.dtype).removeprefix("torch.")
+            dtype_parameter_counts[dtype] = (
+                dtype_parameter_counts.get(dtype, 0) + int(tensor.numel())
+            )
         manifest["status"] = "trained"
         manifest["artifact"] = {
             "weights": "facet.safetensors",
             "format": "safetensors",
             "sha256": digest,
+            "sizeBytes": artifact_weights.stat().st_size,
+            "tensorCount": len(converted),
+            "parameterCount": parameter_count,
+            "dtypeParameterCounts": dict(sorted(dtype_parameter_counts.items())),
         }
         manifest.setdefault("metadata", {}).update(
             {
@@ -873,6 +962,7 @@ class ParameterServer:
                 "status": "succeeded",
                 "facet": f"{manifest['id']}@{manifest['version']}",
                 "artifactSha256": digest,
+                "artifact": copy.deepcopy(manifest["artifact"]),
                 "metrics": metrics,
             },
         )
