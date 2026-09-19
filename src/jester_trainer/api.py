@@ -12,11 +12,16 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from .errors import AuthenticationError, TrainerError
+from .channel_sessions import ChannelSessionDenied, ManagedChannelGuard
 from .models import Campaign, DatasetManifest
 from .service import TrainerService
 
 
-def create_app(service: TrainerService | None = None) -> FastAPI:
+def create_app(
+    service: TrainerService | None = None, *,
+    managed_channel_guard: ManagedChannelGuard | None = None,
+    require_managed_session: bool = False,
+) -> FastAPI:
     trainer = service or TrainerService()
 
     @asynccontextmanager
@@ -39,6 +44,23 @@ def create_app(service: TrainerService | None = None) -> FastAPI:
     @app.middleware("http")
     async def request_id(request: Request, call_next: Any) -> Response:
         request.state.request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex
+        if require_managed_session and request.url.path != "/v1/health":
+            operation = None
+            campaign_id = None
+            if request.method == "POST" and request.url.path == "/v1/campaigns":
+                operation = "trainer.campaign:create"
+            elif request.method == "GET" and request.url.path.startswith("/v1/campaigns/"):
+                operation = "trainer.campaign:status"
+                campaign_id = request.url.path.rsplit("/", 1)[-1]
+            try:
+                authorize_managed_channel(request, operation=operation or "", campaign_id=campaign_id)
+                if operation is None:
+                    raise ChannelSessionDenied("managed channel operation is not allowed")
+            except (ChannelSessionDenied, TrainerError):
+                return JSONResponse(status_code=401, content={
+                    "code": "channel_session_denied", "detail": "managed channel session is not authorized",
+                    "requestId": request.state.request_id,
+                })
         response = await call_next(request)
         response.headers["X-Request-ID"] = request.state.request_id
         return response
@@ -75,12 +97,30 @@ def create_app(service: TrainerService | None = None) -> FastAPI:
             media_type="application/problem+json",
         )
 
-    def auth(authorization: str | None = Header(default=None, alias="Authorization")) -> None:
+    def auth(request: Request, authorization: str | None = Header(default=None, alias="Authorization")) -> None:
+        if require_managed_session:
+            # The managed middleware below validates every non-health route;
+            # never fall back to the legacy administrative token there.
+            return
         expected = f"Bearer {trainer.token}"
         if authorization is None or not secrets.compare_digest(authorization, expected):
             raise AuthenticationError()
 
     secured = [Depends(auth)]
+
+    def authorize_managed_channel(request: Request, *, operation: str, campaign_id: str | None = None) -> None:
+        if not require_managed_session:
+            return
+        if managed_channel_guard is None:
+            raise TrainerError("managed channel session is not authorized", code="channel_session_denied", status=401)
+        if campaign_id is not None:
+            allowed = getattr(managed_channel_guard, "allowed_campaign_ids", None)
+            if not allowed or campaign_id not in allowed:
+                raise TrainerError("managed channel session is not authorized", code="channel_session_denied", status=403)
+        try:
+            managed_channel_guard.authorize(request.headers, operation=operation, method=request.method)
+        except ChannelSessionDenied as exc:
+            raise TrainerError("managed channel session is not authorized", code="channel_session_denied", status=401) from exc
 
     @app.get("/v1/health")
     def health() -> dict[str, Any]:
@@ -154,8 +194,10 @@ def create_app(service: TrainerService | None = None) -> FastAPI:
     @app.post("/v1/campaigns", status_code=201, dependencies=secured)
     def create_campaign(
         campaign: Campaign,
+        request: Request,
         idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     ) -> dict[str, Any]:
+        authorize_managed_channel(request, operation="trainer.campaign:create")
         return trainer.idempotent(
             "campaigns.create",
             idempotency_key,
@@ -164,7 +206,8 @@ def create_app(service: TrainerService | None = None) -> FastAPI:
         )
 
     @app.get("/v1/campaigns/{campaign_id}", dependencies=secured)
-    def campaign(campaign_id: str) -> dict[str, Any]:
+    def campaign(campaign_id: str, request: Request) -> dict[str, Any]:
+        authorize_managed_channel(request, operation="trainer.campaign:status", campaign_id=campaign_id)
         return trainer.get_campaign(campaign_id).api_dict()
 
     @app.patch("/v1/campaigns/{campaign_id}", dependencies=secured)
