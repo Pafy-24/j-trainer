@@ -9,6 +9,7 @@ description = "Jester component 5/5: RM-managed distributed facet training coord
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "jester-rm-client>=0.1,<1",
   "fastapi>=0.115,<1",
   "pydantic>=2.8,<3",
   "psutil>=5.9,<8",
