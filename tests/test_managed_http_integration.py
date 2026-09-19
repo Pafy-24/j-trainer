@@ -1,5 +1,11 @@
 ﻿from __future__ import annotations
 
+import os
+import pytest
+
+if os.environ.get("JESTER_CROSS_REPO_TESTS") != "1":
+    pytest.skip("cross-repo RM/component integration; set JESTER_CROSS_REPO_TESTS=1", allow_module_level=True)
+
 import json
 import os
 import sys
@@ -83,3 +89,19 @@ def test_rm_issued_session_controls_actual_trainer_campaign_handlers(tmp_path, m
         
         controller.close()
 
+
+
+def test_campaign_owner_is_immutable_across_store_reopen(tmp_path):
+    from jester_trainer.db import StateStore
+    from jester_trainer.errors import ConflictError
+    path = tmp_path / "owners.sqlite3"
+    first = StateStore(path)
+    first.bind_campaign_owner("campaign-one", project_id="project-a", deployment_id="deployment-a")
+    assert first.campaign_owner("campaign-one") == ("project-a", "deployment-a")
+    first.close()
+    reopened = StateStore(path)
+    assert reopened.campaign_owner("campaign-one") == ("project-a", "deployment-a")
+    with pytest.raises(ConflictError) as conflict:
+        reopened.bind_campaign_owner("campaign-one", project_id="project-b", deployment_id="deployment-b")
+    assert conflict.value.code == "campaign_owner_conflict"
+    reopened.close()
