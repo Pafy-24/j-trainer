@@ -30,15 +30,7 @@ from jester_trainer.api import create_app
 from tests.helpers import campaign
 
 
-class _RouteService:
-    def __init__(self, root):
-        from jester_trainer.db import StateStore
-        self.token="legacy"; self.campaigns={}; self.store=StateStore(root / "trainer.sqlite3")
-    def close(self): pass
-    def health(self): return {"status":"ok"}
-    def idempotent(self, _scope, _key, _payload, action): return action()
-    def put_campaign(self, item): self.campaigns[item.metadata.id]=item; return item.api_dict()
-    def get_campaign(self, identifier): return self.campaigns[identifier]
+class _RouteService: pass
 
 
 def _post(client, path, credential, payload=None):
@@ -74,7 +66,12 @@ def test_rm_issued_session_controls_actual_trainer_campaign_handlers(tmp_path, m
         def local(operation: str, method: str):
             return {"destinationInstanceId":"trainer-one","destinationInstanceGeneration":1,"destinationLeaseId":"trainer-lease","operation":operation,"method":method}
         guard = ManagedChannelGuard(ManagedChannelContext(rm_url="http://unused"), introspect=lambda credential, expected: controller.introspect_controller_channel_session(credential, expectation=expected) or {}, expectation_provider=local)
-        service = _RouteService(tmp_path)
+        from jester_trainer.config import Settings as TrainerSettings
+        from jester_trainer.service import TrainerService
+        from tests.helpers import dataset_manifest
+        data = tmp_path / "train.jsonl"; data.write_text('{"id":"one","text":"x"}\n', encoding="utf-8")
+        service = TrainerService(TrainerSettings.for_test(tmp_path / "trainer", topology={"topologyId":"test-training-topology","topologyType":"training","role":"trainer","nodeId":"trainer","channels":[],"nodes":[]}))
+        service.put_dataset(dataset_manifest(data))
         body = campaign(tmp_path, tmp_path / "model", campaign_id="campaign-one", version="v1", workers=[]).api_dict()
         with TestClient(create_app(service, managed_channel_guard=guard, require_managed_session=True)) as client:
             created = _post(client, "/v1/campaigns", first["credential"], body)
