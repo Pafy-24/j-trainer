@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import secrets
 import uuid
 from contextlib import asynccontextmanager
@@ -49,13 +50,17 @@ def create_app(
             campaign_id = None
             if request.method == "POST" and request.url.path == "/v1/campaigns":
                 operation = "trainer.campaign:create"
-            elif request.method == "GET" and request.url.path.startswith("/v1/campaigns/"):
+            elif request.method == "GET" and (
+                match := re.fullmatch(r"/v1/campaigns/([^/]+)", request.url.path)
+            ):
                 operation = "trainer.campaign:status"
-                campaign_id = request.url.path.rsplit("/", 1)[-1]
+                campaign_id = match.group(1)
             try:
-                authorize_managed_channel(request, operation=operation or "", campaign_id=campaign_id)
                 if operation is None:
                     raise ChannelSessionDenied("managed channel operation is not allowed")
+                authorize_managed_channel(
+                    request, operation=operation, campaign_id=campaign_id
+                )
             except (ChannelSessionDenied, TrainerError):
                 return JSONResponse(status_code=401, content={
                     "code": "channel_session_denied", "detail": "managed channel session is not authorized",
@@ -111,12 +116,24 @@ def create_app(
     def authorize_managed_channel(request: Request, *, operation: str, campaign_id: str | None = None) -> Any:
         if not require_managed_session:
             return
+        binding = (operation, request.method, campaign_id)
+        cached = getattr(request.state, "managed_channel_claims", None)
+        if cached is not None:
+            if getattr(request.state, "managed_channel_binding", None) != binding:
+                raise TrainerError(
+                    "managed channel session is not authorized",
+                    code="channel_session_denied",
+                    status=401,
+                )
+            return cached
         if managed_channel_guard is None:
             raise TrainerError("managed channel session is not authorized", code="channel_session_denied", status=401)
         try:
             claims = managed_channel_guard.authorize(request.headers, operation=operation, method=request.method)
             if campaign_id is not None and trainer.store.campaign_owner(campaign_id) != (claims.project_id, claims.deployment_id):
                 raise TrainerError("managed channel session is not authorized", code="channel_session_denied", status=403)
+            request.state.managed_channel_claims = claims
+            request.state.managed_channel_binding = binding
             return claims
         except ChannelSessionDenied as exc:
             raise TrainerError("managed channel session is not authorized", code="channel_session_denied", status=401) from exc

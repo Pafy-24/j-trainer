@@ -98,7 +98,10 @@ def test_managed_campaign_owner_rejects_cross_owner_replays_and_survives_restart
             "method": method,
         }
 
+    introspection_calls: list[tuple[str, str]] = []
+
     def introspect(credential: str, expected: dict[str, object]) -> dict[str, object]:
+        introspection_calls.append((str(expected["operation"]), str(expected["method"])))
         project, deployment = (
             ("project-a", "deployment-a")
             if credential == "owner-a"
@@ -144,6 +147,7 @@ def test_managed_campaign_owner_rejects_cross_owner_replays_and_survives_restart
         created = client.post("/v1/campaigns", headers=owner_a_headers, json=owner_a_campaign)
         assert created.status_code == 201
         assert created.json()["metadata"]["id"] == "campaign-one"
+        assert introspection_calls == [("trainer.campaign:create", "POST")]
 
         # Both replays are rejected before the idempotency result can expose owner A's campaign.
         same_key = client.post("/v1/campaigns", headers=owner_b_headers, json=owner_a_campaign)
@@ -169,6 +173,7 @@ def test_managed_campaign_owner_rejects_cross_owner_replays_and_survives_restart
     with TestClient(
         create_app(reopened, managed_channel_guard=guard, require_managed_session=True)
     ) as client:
+        calls_before_status = len(introspection_calls)
         owner_a_status = client.get(
             "/v1/campaigns/campaign-one",
             headers={"X-Jester-Component-Session": "owner-a"},
@@ -180,4 +185,88 @@ def test_managed_campaign_owner_rejects_cross_owner_replays_and_survives_restart
         assert owner_a_status.status_code == 200
         assert owner_a_status.json()["metadata"]["id"] == "campaign-one"
         assert owner_b_status.status_code == 401
+        # The middleware validates status once and the handler reuses those claims.
+        assert len(introspection_calls) == calls_before_status + 2
+        nested = client.get(
+            "/v1/campaigns/campaign-one/events",
+            headers={"X-Jester-Component-Session": "owner-a"},
+        )
+        assert nested.status_code == 401
+        assert len(introspection_calls) == calls_before_status + 2
     reopened.close()
+
+
+def test_managed_create_cannot_claim_existing_unowned_legacy_campaign(tmp_path: Path) -> None:
+    from tests.helpers import campaign, dataset_manifest
+
+    data = tmp_path / "data.jsonl"
+    data.write_text('{"id":"legacy","text":"x"}\n', encoding="utf-8")
+    settings = Settings.for_test(
+        tmp_path / "trainer",
+        topology={
+            "topologyId": "test-training-topology",
+            "topologyType": "training",
+            "role": "trainer",
+            "nodeId": "trainer",
+            "channels": [],
+            "nodes": [],
+        },
+    )
+    service = TrainerService(settings)
+    service.put_dataset(dataset_manifest(data))
+    legacy = campaign(
+        tmp_path,
+        tmp_path / "model",
+        campaign_id="legacy-campaign",
+        version="v1",
+        workers=[],
+    )
+    original = service.put_campaign(legacy)
+
+    def local(operation: str, method: str) -> dict[str, object]:
+        return {
+            "destinationInstanceId": "trainer",
+            "destinationInstanceGeneration": 1,
+            "destinationLeaseId": "lease",
+            "operation": operation,
+            "method": method,
+        }
+
+    def introspect(_credential: str, expected: dict[str, object]) -> dict[str, object]:
+        return {
+            "schemaVersion": "jester-channel-session-claims-v1",
+            "active": True,
+            "sessionId": "owner-a",
+            "projectId": "project-a",
+            "deploymentId": "deployment-a",
+            "deploymentGeneration": 1,
+            "engineInstanceId": "engine",
+            "engineInstanceGeneration": 1,
+            "engineLeaseId": "engine-lease",
+            "channelId": "channel",
+            "destinationMemberId": "trainer",
+            "destinationInstanceId": "trainer",
+            "destinationInstanceGeneration": 1,
+            "destinationLeaseId": "lease",
+            "operation": expected["operation"],
+            "method": expected["method"],
+            "expiresAt": "2030-01-01T00:00:00+00:00",
+        }
+
+    guard = ManagedChannelGuard(
+        ManagedChannelContext(rm_url="http://unused"),
+        introspect=introspect,
+        expectation_provider=local,
+    )
+    with TestClient(
+        create_app(service, managed_channel_guard=guard, require_managed_session=True)
+    ) as client:
+        denied = client.post(
+            "/v1/campaigns",
+            headers={"X-Jester-Component-Session": "owner-a", "Idempotency-Key": "claim"},
+            json=legacy.api_dict(),
+        )
+        assert denied.status_code == 409
+        assert denied.json()["code"] == "campaign_owner_missing"
+        assert service.store.campaign_owner("legacy-campaign") is None
+        assert service.get_campaign("legacy-campaign").api_dict() == original

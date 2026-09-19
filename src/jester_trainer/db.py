@@ -77,7 +77,13 @@ class StateStore:
             self.connection.close()
 
     def bind_campaign_owner(self, campaign_id: str, *, project_id: str, deployment_id: str) -> None:
-        """Atomically reserve immutable managed ownership before campaign mutation."""
+        """Atomically reserve immutable managed ownership before campaign mutation.
+
+        A managed caller cannot adopt an existing legacy campaign without an
+        explicit owner record. A reservation remains after a later create
+        failure so its original owner can retry while another deployment
+        cannot take over the campaign id.
+        """
         with self._lock:
             self.connection.execute("BEGIN IMMEDIATE")
             try:
@@ -85,6 +91,15 @@ class StateStore:
                 if row is not None and (row["project_id"], row["deployment_id"]) != (project_id, deployment_id):
                     raise ConflictError("campaign is owned by another deployment", code="campaign_owner_conflict")
                 if row is None:
+                    legacy = self.connection.execute(
+                        "SELECT 1 FROM entities WHERE kind='campaign' AND entity_id=? AND archived=0",
+                        (campaign_id,),
+                    ).fetchone()
+                    if legacy is not None:
+                        raise ConflictError(
+                            "existing unmanaged campaign cannot be claimed by a managed deployment",
+                            code="campaign_owner_missing",
+                        )
                     self.connection.execute("INSERT INTO campaign_owners(campaign_id, project_id, deployment_id, created_at) VALUES(?,?,?,?)", (campaign_id, project_id, deployment_id, utc_now()))
                 self.connection.commit()
             except BaseException:
