@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 from urllib.request import Request, urlopen
@@ -13,51 +14,56 @@ class ChannelSessionDenied(PermissionError):
 
 @dataclass(frozen=True)
 class ManagedChannelContext:
-    """Trusted launch-time binding; never populated from request headers."""
-    session_id: str
+    """Trusted launch configuration plus a current effective destination lease."""
+    rm_url: str
     project_id: str
     deployment_id: str
-    deployment_generation: int
-    engine_instance_id: str
-    engine_instance_generation: int
-    engine_lease_id: str
-    channel_id: str
-    destination_member_id: str
-    destination_instance_id: str
-    destination_instance_generation: int
-    destination_lease_id: str
-    allowed_campaign_ids: frozenset[str] = frozenset()
+
+    @staticmethod
+    def from_environment() -> "ManagedChannelContext":
+        rm_url = os.environ.get("JESTER_RM_URL", "").strip()
+        project_id = os.environ.get("JESTER_PROJECT_ID", "").strip()
+        deployment_id = os.environ.get("JESTER_DEPLOYMENT_ID", "").strip()
+        if not rm_url or not project_id or not deployment_id:
+            raise ChannelSessionDenied("managed channel context is incomplete")
+        return ManagedChannelContext(rm_url=rm_url, project_id=project_id, deployment_id=deployment_id)
 
     def expectation(self, operation: str, method: str) -> dict[str, Any]:
+        try:
+            from jester_rm_client import require_lease
+            lease = require_lease()
+        except Exception as exc:
+            raise ChannelSessionDenied("managed destination lease is unavailable") from exc
+        instance_id = str(lease.instance.get("metadata", {}).get("id", ""))
+        generation = int(lease.instance.get("generation", 0))
+        if not instance_id or generation < 1 or not lease.lease_id:
+            raise ChannelSessionDenied("managed destination lease is incomplete")
         return {
-            "sessionId": self.session_id, "projectId": self.project_id,
-            "deploymentId": self.deployment_id, "deploymentGeneration": self.deployment_generation,
-            "engineInstanceId": self.engine_instance_id, "engineInstanceGeneration": self.engine_instance_generation,
-            "engineLeaseId": self.engine_lease_id, "channelId": self.channel_id,
-            "destinationMemberId": self.destination_member_id, "destinationInstanceId": self.destination_instance_id,
-            "destinationInstanceGeneration": self.destination_instance_generation,
-            "destinationLeaseId": self.destination_lease_id, "operation": operation, "method": method,
+            "destinationInstanceId": instance_id, "destinationInstanceGeneration": generation,
+            "destinationLeaseId": lease.lease_id, "operation": operation, "method": method,
         }
 
 
 class ManagedChannelGuard:
-    def __init__(self, context: ManagedChannelContext, *, introspect: Callable[[str, dict[str, Any]], Mapping[str, Any]]):
+    def __init__(self, context: ManagedChannelContext, *, introspect: Callable[[str, dict[str, Any]], Mapping[str, Any]] | None = None, expectation_provider: Callable[[str, str], dict[str, Any]] | None = None):
         self._context = context
-        self.allowed_campaign_ids = context.allowed_campaign_ids
-        self._introspect = introspect
+        self._introspect = introspect or rm_introspector(context.rm_url)
+        self._expectation_provider = expectation_provider or context.expectation
 
     def authorize(self, headers: Mapping[str, str], *, operation: str, method: str) -> None:
         credential = headers.get("X-Jester-Component-Session")
         if not credential:
             raise ChannelSessionDenied("managed channel session is required")
-        expectation_data = self._context.expectation(operation, method)
+        local = self._expectation_provider(operation, method)
         try:
             from jester_core.channel_sessions import (
-                ChannelSessionExpectation, ChannelSessionValidationError, validate_channel_session_claims,
+                DestinationChannelExpectation, ChannelSessionValidationError,
+                validate_destination_channel_claims,
             )
-            claims = self._introspect(credential, expectation_data)
-            validate_channel_session_claims(claims, ChannelSessionExpectation.model_validate(expectation_data))
-        except (ChannelSessionValidationError, ValueError, OSError, KeyError, TypeError) as exc:
+            claims = dict(self._introspect(credential, local))
+            expected = DestinationChannelExpectation.model_validate(local)
+            validate_destination_channel_claims(claims, expected)
+        except (ImportError, ChannelSessionValidationError, ValueError, OSError, KeyError, TypeError) as exc:
             raise ChannelSessionDenied("managed channel session is not authorized") from exc
 
 
@@ -67,6 +73,10 @@ def rm_introspector(rm_base_url: str) -> Callable[[str, dict[str, Any]], Mapping
         request = Request(endpoint, data=json.dumps(expectation).encode("utf-8"), method="POST")
         request.add_header("Content-Type", "application/json")
         request.add_header("X-Jester-Component-Session", credential)
-        with urlopen(request, timeout=5) as response:  # no credential is logged
+        with urlopen(request, timeout=5) as response:
             return json.loads(response.read().decode("utf-8"))
     return call
+
+
+def guard_from_managed_environment() -> ManagedChannelGuard:
+    return ManagedChannelGuard(ManagedChannelContext.from_environment())

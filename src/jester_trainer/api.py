@@ -40,6 +40,7 @@ def create_app(
         lifespan=lifespan,
     )
     app.state.trainer = trainer
+    app.state.managed_channel_campaign_ids = set()
 
     @app.middleware("http")
     async def request_id(request: Request, call_next: Any) -> Response:
@@ -113,10 +114,8 @@ def create_app(
             return
         if managed_channel_guard is None:
             raise TrainerError("managed channel session is not authorized", code="channel_session_denied", status=401)
-        if campaign_id is not None:
-            allowed = getattr(managed_channel_guard, "allowed_campaign_ids", None)
-            if not allowed or campaign_id not in allowed:
-                raise TrainerError("managed channel session is not authorized", code="channel_session_denied", status=403)
+        if campaign_id is not None and campaign_id not in app.state.managed_channel_campaign_ids:
+            raise TrainerError("managed channel session is not authorized", code="channel_session_denied", status=403)
         try:
             managed_channel_guard.authorize(request.headers, operation=operation, method=request.method)
         except ChannelSessionDenied as exc:
@@ -198,12 +197,15 @@ def create_app(
         idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     ) -> dict[str, Any]:
         authorize_managed_channel(request, operation="trainer.campaign:create")
-        return trainer.idempotent(
+        result = trainer.idempotent(
             "campaigns.create",
             idempotency_key,
             _idempotency_payload(campaign),
             lambda: trainer.put_campaign(campaign),
         )
+        if require_managed_session:
+            app.state.managed_channel_campaign_ids.add(campaign.metadata.id)
+        return result
 
     @app.get("/v1/campaigns/{campaign_id}", dependencies=secured)
     def campaign(campaign_id: str, request: Request) -> dict[str, Any]:
