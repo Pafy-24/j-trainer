@@ -149,6 +149,55 @@ def test_managed_campaign_owner_rejects_cross_owner_replays_and_survives_restart
         assert created.json()["metadata"]["id"] == "campaign-one"
         assert introspection_calls == [("trainer.campaign:create", "POST")]
 
+        def queued_start(
+            campaign_id: str, *, operation_id: str | None = None
+        ) -> dict[str, object]:
+            operation = {
+                "operationId": operation_id,
+                "action": "campaign.start",
+                "targetId": campaign_id,
+                "state": "queued",
+                "createdAt": "2026-09-20T00:00:00Z",
+                "updatedAt": "2026-09-20T00:00:00Z",
+            }
+            service.store.put_operation(operation)
+            return operation
+
+        service.start_campaign = queued_start  # type: ignore[method-assign]
+        started = client.post(
+            "/v1/campaigns/campaign-one/actions/start",
+            headers={**owner_a_headers, "Idempotency-Key": "start-one"},
+            json={"operationId": "engine.trainer." + "a" * 32},
+        )
+        denied_start = client.post(
+            "/v1/campaigns/campaign-one/actions/start",
+            headers={**owner_b_headers, "Idempotency-Key": "start-two"},
+            json={"operationId": "engine.trainer." + "b" * 32},
+        )
+        execution = client.get(
+            "/v1/campaigns/campaign-one/execution?operationId=engine.trainer."
+            + "a" * 32,
+            headers={"X-Jester-Component-Session": "owner-a"},
+        )
+        denied_execution = client.get(
+            "/v1/campaigns/campaign-one/execution?operationId=engine.trainer."
+            + "a" * 32,
+            headers={"X-Jester-Component-Session": "owner-b"},
+        )
+        assert started.status_code == 202
+        assert started.json()["operationId"] == "engine.trainer." + "a" * 32
+        assert denied_start.status_code == 401
+        assert execution.status_code == 200
+        assert execution.json()["operation"]["operationId"] == "engine.trainer." + "a" * 32
+        assert execution.json()["schemaVersion"] == "jester-trainer-campaign-execution-v1"
+        assert denied_execution.status_code == 401
+        assert introspection_calls[-4:] == [
+            ("trainer.campaign:start", "POST"),
+            ("trainer.campaign:start", "POST"),
+            ("trainer.campaign:execution", "GET"),
+            ("trainer.campaign:execution", "GET"),
+        ]
+
         # Both replays are rejected before the idempotency result can expose owner A's campaign.
         same_key = client.post("/v1/campaigns", headers=owner_b_headers, json=owner_a_campaign)
         new_key = client.post(

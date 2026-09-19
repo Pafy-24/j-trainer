@@ -232,6 +232,13 @@ class StateStore:
             raise NotFoundError("operation", operation_id)
         return json.loads(row["payload"])
 
+    def list_operations(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self.connection.execute(
+                "SELECT payload FROM operations ORDER BY created_at,operation_id"
+            ).fetchall()
+        return [json.loads(row["payload"]) for row in rows]
+
     def add_event(self, payload: dict[str, Any]) -> dict[str, Any]:
         with self._lock, self.connection:
             cursor = self.connection.execute(

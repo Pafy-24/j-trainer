@@ -50,6 +50,20 @@ def create_app(
             campaign_id = None
             if request.method == "POST" and request.url.path == "/v1/campaigns":
                 operation = "trainer.campaign:create"
+            elif request.method == "POST" and (
+                match := re.fullmatch(
+                    r"/v1/campaigns/([^/]+)/actions/start", request.url.path
+                )
+            ):
+                operation = "trainer.campaign:start"
+                campaign_id = match.group(1)
+            elif request.method == "GET" and (
+                match := re.fullmatch(
+                    r"/v1/campaigns/([^/]+)/execution", request.url.path
+                )
+            ):
+                operation = "trainer.campaign:execution"
+                campaign_id = match.group(1)
             elif request.method == "GET" and (
                 match := re.fullmatch(r"/v1/campaigns/([^/]+)", request.url.path)
             ):
@@ -288,16 +302,51 @@ def create_app(
             f"campaigns.{action}:{campaign_id}",
             idempotency_key,
             payload,
-            lambda: actions[action](campaign_id),
+            lambda: (
+                trainer.start_campaign(
+                    campaign_id,
+                    operation_id=(
+                        payload.get("operationId")
+                        if isinstance(payload.get("operationId"), str)
+                        else None
+                    ),
+                )
+                if action == "start"
+                else actions[action](campaign_id)
+            ),
         )
 
     @app.post("/v1/campaigns/{campaign_id}/actions/start", status_code=202, dependencies=secured)
     def start_campaign(
         campaign_id: str,
+        request: Request,
         payload: dict[str, Any] = Body(default_factory=dict),
         idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     ) -> dict[str, Any]:
+        authorize_managed_channel(
+            request, operation="trainer.campaign:start", campaign_id=campaign_id
+        )
+        if require_managed_session and not (
+            isinstance(payload.get("operationId"), str)
+            and re.fullmatch(r"engine\.trainer\.[0-9a-f]{32}", payload["operationId"])
+        ):
+            raise TrainerError(
+                "Managed campaign start requires a stable Engine operationId",
+                code="operation_id_required",
+                status=422,
+            )
         return campaign_action(campaign_id, "start", payload, idempotency_key)
+
+    @app.get("/v1/campaigns/{campaign_id}/execution", dependencies=secured)
+    def campaign_execution(
+        campaign_id: str,
+        request: Request,
+        operation_id: str | None = Query(default=None, alias="operationId"),
+    ) -> dict[str, Any]:
+        authorize_managed_channel(
+            request, operation="trainer.campaign:execution", campaign_id=campaign_id
+        )
+        return trainer.campaign_execution(campaign_id, operation_id=operation_id)
 
     @app.post("/v1/campaigns/{campaign_id}/actions/pause", status_code=202, dependencies=secured)
     def pause_campaign(

@@ -336,15 +336,32 @@ class TrainerService:
         )
         return self._campaign_plan_payload(campaign, jobs, workers)
 
-    def start_campaign(self, campaign_id: str) -> dict[str, Any]:
+    def start_campaign(
+        self, campaign_id: str, *, operation_id: str | None = None
+    ) -> dict[str, Any]:
         campaign = self.get_campaign(campaign_id)
+        if operation_id is not None:
+            try:
+                existing = self.store.get_operation(operation_id)
+            except NotFoundError:
+                existing = None
+            if existing is not None:
+                if (
+                    existing.get("action") != "campaign.start"
+                    or existing.get("targetId") != campaign_id
+                ):
+                    raise ConflictError(
+                        "Operation identifier belongs to another campaign",
+                        code="operation_identity_conflict",
+                    )
+                return existing
         if campaign.state == CampaignState.RUNNING:
             raise ConflictError("Campaign is already running", code="campaign_running")
         if campaign.state != CampaignState.PLANNED:
             self.plan_campaign(campaign_id)
             campaign = self.get_campaign(campaign_id)
         operation = Operation(
-            operationId=uuid.uuid4().hex,
+            operationId=operation_id or uuid.uuid4().hex,
             action="campaign.start",
             targetId=campaign_id,
             state=OperationState.QUEUED,
@@ -451,6 +468,24 @@ class TrainerService:
 
     def get_operation(self, operation_id: str) -> dict[str, Any]:
         return self.store.get_operation(operation_id)
+
+    def campaign_execution(
+        self, campaign_id: str, *, operation_id: str | None = None
+    ) -> dict[str, Any]:
+        campaign = self.get_campaign(campaign_id)
+        operations = [
+            item for item in self.store.list_operations()
+            if item.get("action") == "campaign.start"
+            and item.get("targetId") == campaign_id
+            and (operation_id is None or item.get("operationId") == operation_id)
+        ]
+        latest = operations[-1] if operations else None
+        return {
+            "schemaVersion": "jester-trainer-campaign-execution-v1",
+            "campaign": campaign.api_dict(),
+            "operation": latest,
+            "jobs": self.campaign_jobs(campaign_id),
+        }
 
     def list_results(self) -> list[dict[str, Any]]:
         return self.store.list_entities("result")
