@@ -16,17 +16,13 @@ class ChannelSessionDenied(PermissionError):
 class ManagedChannelContext:
     """Trusted launch configuration plus a current effective destination lease."""
     rm_url: str
-    project_id: str
-    deployment_id: str
 
     @staticmethod
     def from_environment() -> "ManagedChannelContext":
         rm_url = os.environ.get("JESTER_RM_URL", "").strip()
-        project_id = os.environ.get("JESTER_PROJECT_ID", "").strip()
-        deployment_id = os.environ.get("JESTER_DEPLOYMENT_ID", "").strip()
-        if not rm_url or not project_id or not deployment_id:
+        if not rm_url:
             raise ChannelSessionDenied("managed channel context is incomplete")
-        return ManagedChannelContext(rm_url=rm_url, project_id=project_id, deployment_id=deployment_id)
+        return ManagedChannelContext(rm_url=rm_url)
 
     def expectation(self, operation: str, method: str) -> dict[str, Any]:
         try:

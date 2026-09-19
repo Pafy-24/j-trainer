@@ -61,7 +61,7 @@ def test_api_auth_and_dataset_idempotency(tmp_path: Path) -> None:
 
 def test_managed_api_fails_closed_without_a_session_and_never_uses_bearer(tmp_path: Path) -> None:
     service = TrainerService(Settings.for_test(tmp_path / "trainer"))
-    context = ManagedChannelContext(rm_url="http://rm.invalid", project_id="project-one", deployment_id="deployment-one")
+    context = ManagedChannelContext(rm_url="http://rm.invalid")
     def local(operation: str, method: str) -> dict[str, object]:
         return {"destinationInstanceId": "trainer-one", "destinationInstanceGeneration": 1, "destinationLeaseId": "trainer-lease", "operation": operation, "method": method}
     def introspect(_credential: str, expected: dict[str, object]) -> dict[str, object]:
