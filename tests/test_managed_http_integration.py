@@ -25,7 +25,9 @@ from tests.helpers import campaign
 
 
 class _RouteService:
-    def __init__(self): self.token="legacy"; self.campaigns={}
+    def __init__(self, root):
+        from jester_trainer.db import StateStore
+        self.token="legacy"; self.campaigns={}; self.store=StateStore(root / "trainer.sqlite3")
     def close(self): pass
     def health(self): return {"status":"ok"}
     def idempotent(self, _scope, _key, _payload, action): return action()
@@ -66,7 +68,7 @@ def test_rm_issued_session_controls_actual_trainer_campaign_handlers(tmp_path, m
         def local(operation: str, method: str):
             return {"destinationInstanceId":"trainer-one","destinationInstanceGeneration":1,"destinationLeaseId":"trainer-lease","operation":operation,"method":method}
         guard = ManagedChannelGuard(ManagedChannelContext(rm_url="http://unused"), introspect=lambda credential, expected: controller.introspect_controller_channel_session(credential, expectation=expected) or {}, expectation_provider=local)
-        service = _RouteService()
+        service = _RouteService(tmp_path)
         body = campaign(tmp_path, tmp_path / "model", campaign_id="campaign-one", version="v1", workers=[]).api_dict()
         with TestClient(create_app(service, managed_channel_guard=guard, require_managed_session=True)) as client:
             created = _post(client, "/v1/campaigns", first["credential"], body)

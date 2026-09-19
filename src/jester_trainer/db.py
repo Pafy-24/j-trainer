@@ -55,6 +55,12 @@ class StateStore:
                 );
                 CREATE INDEX IF NOT EXISTS events_campaign_idx
                     ON events(campaign_id, sequence);
+                CREATE TABLE IF NOT EXISTS campaign_owners (
+                    campaign_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    deployment_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS idempotency (
                     scope TEXT NOT NULL,
                     idem_key TEXT NOT NULL,
@@ -69,6 +75,25 @@ class StateStore:
     def close(self) -> None:
         with self._lock:
             self.connection.close()
+
+    def bind_campaign_owner(self, campaign_id: str, *, project_id: str, deployment_id: str) -> None:
+        """Atomically reserve immutable managed ownership before campaign mutation."""
+        with self._lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = self.connection.execute("SELECT project_id, deployment_id FROM campaign_owners WHERE campaign_id=?", (campaign_id,)).fetchone()
+                if row is not None and (row["project_id"], row["deployment_id"]) != (project_id, deployment_id):
+                    raise ConflictError("campaign is owned by another deployment", code="campaign_owner_conflict")
+                if row is None:
+                    self.connection.execute("INSERT INTO campaign_owners(campaign_id, project_id, deployment_id, created_at) VALUES(?,?,?,?)", (campaign_id, project_id, deployment_id, utc_now()))
+                self.connection.commit()
+            except BaseException:
+                self.connection.rollback(); raise
+
+    def campaign_owner(self, campaign_id: str) -> tuple[str, str] | None:
+        with self._lock:
+            row=self.connection.execute("SELECT project_id, deployment_id FROM campaign_owners WHERE campaign_id=?", (campaign_id,)).fetchone()
+        return (str(row["project_id"]), str(row["deployment_id"])) if row else None
 
     def put_entity(
         self,
