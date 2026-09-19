@@ -29,7 +29,7 @@ class Settings:
             effective = require_lease()
         except ImportError as exc:
             raise TrainerError(
-                "RM_LEASE_REQUIRED: jester-resource-manager client is not installed",
+                "RM_LEASE_REQUIRED: jester-rm-client is not installed",
                 code="RM_LEASE_REQUIRED",
                 status=409,
             ) from exc
