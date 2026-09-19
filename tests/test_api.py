@@ -71,3 +71,113 @@ def test_managed_api_fails_closed_without_a_session_and_never_uses_bearer(tmp_pa
         assert client.get("/v1/datasets", headers={"Authorization": f"Bearer {service.token}"}).status_code == 401
         assert client.get("/v1/campaigns/not-allowed", headers={"X-Jester-Component-Session": "opaque-session-token-at-least-24-chars"}).status_code == 401
         assert client.post("/v1/campaigns", headers={"X-Jester-Component-Session": "opaque-session-token-at-least-24-chars"}, json={}).status_code == 422
+
+
+def test_managed_campaign_owner_rejects_cross_owner_replays_and_survives_restart(tmp_path: Path) -> None:
+    from tests.helpers import campaign, dataset_manifest
+    data = tmp_path / "data.jsonl"
+    data.write_text('{"id":"x","text":"x"}\n', encoding="utf-8")
+    topology = {
+        "topologyId": "test-training-topology",
+        "topologyType": "training",
+        "role": "trainer",
+        "nodeId": "trainer",
+        "channels": [],
+        "nodes": [],
+    }
+    settings = Settings.for_test(tmp_path / "trainer", topology=topology)
+    service = TrainerService(settings)
+    service.put_dataset(dataset_manifest(data))
+
+    def local(operation: str, method: str) -> dict[str, object]:
+        return {
+            "destinationInstanceId": "trainer",
+            "destinationInstanceGeneration": 1,
+            "destinationLeaseId": "lease",
+            "operation": operation,
+            "method": method,
+        }
+
+    def introspect(credential: str, expected: dict[str, object]) -> dict[str, object]:
+        project, deployment = (
+            ("project-a", "deployment-a")
+            if credential == "owner-a"
+            else ("project-b", "deployment-b")
+        )
+        return {
+            "schemaVersion": "jester-channel-session-claims-v1",
+            "active": True,
+            "sessionId": credential,
+            "projectId": project,
+            "deploymentId": deployment,
+            "deploymentGeneration": 1,
+            "engineInstanceId": "engine",
+            "engineInstanceGeneration": 1,
+            "engineLeaseId": "engine-lease",
+            "channelId": "channel",
+            "destinationMemberId": "trainer",
+            "destinationInstanceId": "trainer",
+            "destinationInstanceGeneration": 1,
+            "destinationLeaseId": "lease",
+            "operation": expected["operation"],
+            "method": expected["method"],
+            "expiresAt": "2030-01-01T00:00:00+00:00",
+        }
+
+    guard = ManagedChannelGuard(
+        ManagedChannelContext(rm_url="http://unused"),
+        introspect=introspect,
+        expectation_provider=local,
+    )
+    owner_a_campaign = campaign(
+        tmp_path, tmp_path / "model", campaign_id="campaign-one", version="v1", workers=[]
+    ).api_dict()
+    owner_b_campaign = campaign(
+        tmp_path, tmp_path / "model", campaign_id="campaign-two", version="v2", workers=[]
+    ).api_dict()
+    owner_a_headers = {"X-Jester-Component-Session": "owner-a", "Idempotency-Key": "same"}
+    owner_b_headers = {"X-Jester-Component-Session": "owner-b", "Idempotency-Key": "same"}
+
+    with TestClient(
+        create_app(service, managed_channel_guard=guard, require_managed_session=True)
+    ) as client:
+        created = client.post("/v1/campaigns", headers=owner_a_headers, json=owner_a_campaign)
+        assert created.status_code == 201
+        assert created.json()["metadata"]["id"] == "campaign-one"
+
+        # Both replays are rejected before the idempotency result can expose owner A's campaign.
+        same_key = client.post("/v1/campaigns", headers=owner_b_headers, json=owner_a_campaign)
+        new_key = client.post(
+            "/v1/campaigns",
+            headers={**owner_b_headers, "Idempotency-Key": "new"},
+            json=owner_a_campaign,
+        )
+        assert same_key.status_code == 409
+        assert same_key.json()["code"] == "campaign_owner_conflict"
+        assert new_key.status_code == 409
+        assert new_key.json()["code"] == "campaign_owner_conflict"
+
+        # A global idempotency key must not return owner A's result to owner B.
+        different_campaign = client.post(
+            "/v1/campaigns", headers=owner_b_headers, json=owner_b_campaign
+        )
+        assert different_campaign.status_code == 409
+        assert different_campaign.json()["code"] == "idempotency_conflict"
+
+    service.close()
+    reopened = TrainerService(settings)
+    with TestClient(
+        create_app(reopened, managed_channel_guard=guard, require_managed_session=True)
+    ) as client:
+        owner_a_status = client.get(
+            "/v1/campaigns/campaign-one",
+            headers={"X-Jester-Component-Session": "owner-a"},
+        )
+        owner_b_status = client.get(
+            "/v1/campaigns/campaign-one",
+            headers={"X-Jester-Component-Session": "owner-b"},
+        )
+        assert owner_a_status.status_code == 200
+        assert owner_a_status.json()["metadata"]["id"] == "campaign-one"
+        assert owner_b_status.status_code == 401
+    reopened.close()
