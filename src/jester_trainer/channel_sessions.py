@@ -60,10 +60,13 @@ class ManagedChannelGuard:
                 DestinationChannelExpectation, ChannelSessionValidationError,
                 validate_destination_channel_claims,
             )
+        except ImportError as exc:
+            raise ChannelSessionDenied("managed channel validator is unavailable") from exc
+        try:
             claims = dict(self._introspect(credential, local))
             expected = DestinationChannelExpectation.model_validate(local)
             validate_destination_channel_claims(claims, expected)
-        except (ImportError, ChannelSessionValidationError, ValueError, OSError, KeyError, TypeError) as exc:
+        except (ChannelSessionValidationError, ValueError, OSError, KeyError, TypeError) as exc:
             raise ChannelSessionDenied("managed channel session is not authorized") from exc
 
 
