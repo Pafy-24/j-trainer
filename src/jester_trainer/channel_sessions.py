@@ -61,7 +61,7 @@ class ManagedChannelGuard:
         try:
             claims = dict(self._introspect(credential, local))
             expected = DestinationChannelExpectation.model_validate(local)
-            validate_destination_channel_claims(claims, expected)
+            return validate_destination_channel_claims(claims, expected)
         except (ChannelSessionValidationError, ValueError, OSError, KeyError, TypeError) as exc:
             raise ChannelSessionDenied("managed channel session is not authorized") from exc
 
