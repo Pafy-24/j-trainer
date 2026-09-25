@@ -52,6 +52,7 @@ class OperationState(str, Enum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    RECONCILIATION_REQUIRED = "reconciliation-required"
 
 
 class Metadata(APIModel):

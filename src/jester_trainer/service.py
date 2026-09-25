@@ -17,6 +17,7 @@ from .config import Settings
 from .datasets import DatasetManager
 from .db import StateStore
 from .errors import ConflictError, NotFoundError, TrainerError
+from .lifecycle import ControllerLease
 from .models import (
     Campaign,
     CampaignState,
@@ -38,6 +39,7 @@ class TrainerService:
     def __init__(self, settings: Settings | None = None):
         self.settings = settings or Settings.from_rm()
         self.token = self.settings.initialize()
+        self._controller_lease = ControllerLease(self.settings.home)
         self.store = StateStore(self.settings.database)
         artifact_path = os.environ.get("JESTER_RM_ARTIFACT_MANIFEST")
         self.datasets = DatasetManager(artifact_path)
@@ -47,14 +49,38 @@ class TrainerService:
         self._idempotency_lock = threading.RLock()
         self._threads: set[threading.Thread] = set()
         self._campaign_controls: dict[str, dict[str, threading.Event]] = {}
+        self._start_calls = 0
+        self._closing = False
+        self._closed = False
         self._recover_campaigns()
 
     def close(self) -> None:
         with self._lock:
+            if self._closed:
+                return
+            if self._closing or self._start_calls:
+                raise TrainerError(
+                    "Trainer has a campaign start in progress",
+                    code="campaign_start_in_progress",
+                    status=409,
+                )
+            self._closing = True
             threads = list(self._threads)
         for thread in threads:
             thread.join(timeout=5)
+        active = [thread.name for thread in threads if thread.is_alive()]
+        if active:
+            with self._lock:
+                self._closing = False
+            raise TrainerError(
+                "Trainer still has active campaign workers: " + ", ".join(active),
+                code="campaign_workers_active",
+                status=409,
+            )
         self.store.close()
+        self._controller_lease.close()
+        with self._lock:
+            self._closed = True
 
     def health(self) -> dict[str, Any]:
         return {
@@ -288,7 +314,17 @@ class TrainerService:
             "campaign", campaign_id, expected_generation=expected_generation
         )
 
-    def plan_campaign(self, campaign_id: str) -> dict[str, Any]:
+    def plan_campaign(
+        self,
+        campaign_id: str,
+        *,
+        _start_operation_id: str | None = None,
+    ) -> dict[str, Any]:
+        self.store.require_campaign_plan_access(
+            campaign_id,
+            operation_id=_start_operation_id,
+            controller_id=self._controller_lease.instance_id,
+        )
         campaign = self.get_campaign(campaign_id)
         dataset_uses = list(campaign.spec.datasets)
         dataset_uses.extend(
@@ -316,17 +352,17 @@ class TrainerService:
             self._expand_jobs(campaign),
             existing,
         )
-        for job in jobs:
-            self.store.put_entity("job", job.job_id, job.api_dict())
         planned = campaign.model_copy(
             update={"state": CampaignState.PLANNED, "updated_at": utc_now()}
         )
         campaign = Campaign.model_validate(
-            self.store.put_entity(
-                "campaign",
+            self.store.commit_campaign_plan(
                 campaign_id,
                 planned.api_dict(),
+                [job.api_dict() for job in jobs],
                 expected_generation=campaign.generation,
+                operation_id=_start_operation_id,
+                controller_id=self._controller_lease.instance_id,
             )
         )
         self._event(
@@ -339,44 +375,87 @@ class TrainerService:
     def start_campaign(
         self, campaign_id: str, *, operation_id: str | None = None
     ) -> dict[str, Any]:
-        campaign = self.get_campaign(campaign_id)
-        if operation_id is not None:
-            try:
-                existing = self.store.get_operation(operation_id)
-            except NotFoundError:
-                existing = None
-            if existing is not None:
-                if (
-                    existing.get("action") != "campaign.start"
-                    or existing.get("targetId") != campaign_id
-                ):
-                    raise ConflictError(
-                        "Operation identifier belongs to another campaign",
-                        code="operation_identity_conflict",
-                    )
-                return existing
-        if campaign.state == CampaignState.RUNNING:
-            raise ConflictError("Campaign is already running", code="campaign_running")
-        if campaign.state != CampaignState.PLANNED:
-            self.plan_campaign(campaign_id)
-            campaign = self.get_campaign(campaign_id)
+        with self._lock:
+            if self._closing or self._closed:
+                raise TrainerError(
+                    "Trainer service is closing",
+                    code="trainer_service_closing",
+                    status=409,
+                )
+            self._start_calls += 1
+        try:
+            return self._start_campaign(campaign_id, operation_id=operation_id)
+        finally:
+            with self._lock:
+                self._start_calls -= 1
+
+    def _start_campaign(
+        self, campaign_id: str, *, operation_id: str | None = None
+    ) -> dict[str, Any]:
         operation = Operation(
             operationId=operation_id or uuid.uuid4().hex,
             action="campaign.start",
             targetId=campaign_id,
             state=OperationState.QUEUED,
         )
-        self.store.put_operation(operation.api_dict())
+        receipt, acquired = self.store.reserve_campaign_start(
+            campaign_id,
+            operation.api_dict(),
+            controller_id=self._controller_lease.instance_id,
+        )
+        if not acquired:
+            return receipt
+        try:
+            campaign = self.get_campaign(campaign_id)
+            if campaign.state != CampaignState.PLANNED:
+                self.plan_campaign(
+                    campaign_id, _start_operation_id=operation.operation_id
+                )
+            else:
+                self.store.require_campaign_start_reservation(
+                    campaign_id,
+                    operation.operation_id,
+                    controller_id=self._controller_lease.instance_id,
+                )
+        except BaseException as exc:
+            failed = operation.model_copy(
+                update={
+                    "state": OperationState.FAILED,
+                    "updated_at": utc_now(),
+                    "error": {
+                        "code": getattr(exc, "code", "campaign_start_failed"),
+                        "detail": f"{type(exc).__name__}: {exc}",
+                    },
+                }
+            )
+            self.store.put_operation(
+                failed.api_dict(), controller_id=self._controller_lease.instance_id
+            )
+            raise
         controls = {
             "pause": threading.Event(),
             "cancel": threading.Event(),
         }
         with self._lock:
             self._campaign_controls[campaign_id] = controls
-        self._spawn(
-            f"campaign-{campaign_id}",
-            lambda: self._run_campaign(operation.operation_id, campaign_id),
+        self.store.mark_campaign_start_launch_committed(
+            campaign_id,
+            operation.operation_id,
+            controller_id=self._controller_lease.instance_id,
         )
+        try:
+            self._spawn(
+                f"campaign-{campaign_id}",
+                lambda: self._run_campaign(operation.operation_id, campaign_id),
+            )
+        except BaseException:
+            self.store.mark_campaign_start_reconciliation_required(
+                campaign_id,
+                operation.operation_id,
+                controller_id=self._controller_lease.instance_id,
+                reason="Controller could not prove whether the committed launch began",
+            )
+            raise
         return operation.api_dict()
 
     def pause_campaign(self, campaign_id: str) -> dict[str, Any]:
@@ -527,13 +606,14 @@ class TrainerService:
             if previous is not None:
                 return previous
             result = action()
-            self.store.put_idempotent(scope, key, request_hash, result)
-            return result
+            return self.store.put_idempotent(scope, key, request_hash, result)
 
     def _run_campaign(self, operation_id: str, campaign_id: str) -> None:
         operation = Operation.model_validate(self.store.get_operation(operation_id))
         operation = operation.model_copy(update={"state": OperationState.RUNNING})
-        self.store.put_operation(operation.api_dict())
+        self.store.put_operation(
+            operation.api_dict(), controller_id=self._controller_lease.instance_id
+        )
         try:
             self._set_campaign_state(campaign_id, CampaignState.RUNNING)
             campaign = self.get_campaign(campaign_id)
@@ -618,7 +698,10 @@ class TrainerService:
                     "result": result,
                 }
             )
-            self.store.put_operation(completed_operation.api_dict())
+            self.store.put_operation(
+                completed_operation.api_dict(),
+                controller_id=self._controller_lease.instance_id,
+            )
             self._event("CAMPAIGN_SUCCEEDED", campaign_id=campaign_id)
         except BaseException as exc:
             current = self.get_campaign(campaign_id)
@@ -634,7 +717,9 @@ class TrainerService:
                     },
                 }
             )
-            self.store.put_operation(failed.api_dict())
+            self.store.put_operation(
+                failed.api_dict(), controller_id=self._controller_lease.instance_id
+            )
             self._event(
                 "CAMPAIGN_FAILED",
                 campaign_id=campaign_id,
@@ -1202,8 +1287,25 @@ class TrainerService:
         thread.start()
 
     def _recover_campaigns(self) -> None:
+        reservations = self.store.incomplete_campaign_starts()
+        reserved_campaigns = {item["campaign_id"] for item in reservations}
+        for reservation in reservations:
+            if self._controller_lease.owner_is_active(reservation["controller_id"]):
+                continue
+            self.store.mark_campaign_start_reconciliation_required(
+                reservation["campaign_id"],
+                reservation["operation_id"],
+                controller_id=reservation["controller_id"],
+                reason=(
+                    "The controller that reserved this start is no longer active; "
+                    "Trainer will not launch replacement work automatically"
+                ),
+            )
         for payload in self.store.list_entities("campaign"):
-            if payload.get("state") in {"running", "recovering"}:
+            if (
+                payload.get("state") in {"running", "recovering"}
+                and payload.get("metadata", {}).get("id") not in reserved_campaigns
+            ):
                 campaign = Campaign.model_validate(payload)
                 recovering = campaign.model_copy(
                     update={"state": CampaignState.RECOVERING}
