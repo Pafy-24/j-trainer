@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
 import torch
+import pytest
 
 from jester_trainer.config import Settings
+from jester_trainer.errors import TrainerError
+from jester_trainer.models import TrainingAttempt, TrainingJob
 from jester_trainer.parameter_server import ParameterServer
 from jester_trainer.service import TrainerService
 
@@ -15,11 +20,63 @@ from .helpers import (
     artifact_weights,
     campaign,
     dataset_manifest,
-    run_campaign,
     tiny_model,
     training_dataset,
     worker_topology,
 )
+
+
+def _run_campaign_observed(
+    service: TrainerService, campaign_model: object, timeout: float = 90
+) -> dict:
+    background_errors: list[dict[str, str]] = []
+    previous_hook = threading.excepthook
+
+    def capture(args: threading.ExceptHookArgs) -> None:
+        background_errors.append(
+            {
+                "thread": args.thread.name if args.thread is not None else "unknown",
+                "exceptionType": args.exc_type.__name__,
+                "detail": str(args.exc_value),
+            }
+        )
+        previous_hook(args)
+
+    threading.excepthook = capture
+    try:
+        service.put_campaign(campaign_model)  # type: ignore[arg-type]
+        campaign_id = campaign_model.metadata.id  # type: ignore[attr-defined]
+        service.plan_campaign(campaign_id)
+        operation = service.start_campaign(campaign_id)
+        deadline = time.monotonic() + timeout
+        current = service.get_operation(operation["operationId"])
+        while time.monotonic() < deadline and current["state"] not in {
+            "succeeded",
+            "failed",
+            "cancelled",
+            "reconciliation-required",
+        }:
+            time.sleep(0.05)
+            current = service.get_operation(operation["operationId"])
+        if current["state"] == "succeeded":
+            return current
+        time.sleep(0.05)
+        diagnostics = {
+            "operation": current,
+            "campaign": service.get_campaign(campaign_id).api_dict(),
+            "cancellation": service.campaign_execution(
+                campaign_id, operation_id=operation["operationId"]
+            )["cancellation"],
+            "jobs": service.campaign_jobs(campaign_id),
+            "attempts": service.store.list_entities("attempt"),
+            "workerSessions": service.store.list_entities("worker-session"),
+            "activeStart": service.store.active_campaign_start(campaign_id),
+            "backgroundExceptions": background_errors,
+            "liveThreads": sorted(thread.name for thread in threading.enumerate()),
+        }
+        raise AssertionError(json.dumps(diagnostics, sort_keys=True, default=str))
+    finally:
+        threading.excepthook = previous_hook
 
 
 def test_two_worker_update_matches_combined_single_worker_batch() -> None:
@@ -33,7 +90,7 @@ def test_two_worker_update_matches_combined_single_worker_batch() -> None:
             service = TrainerService(Settings.for_test(root / "trainer", topology))
             try:
                 service.put_dataset(dataset_manifest(data))
-                distributed = run_campaign(
+                distributed = _run_campaign_observed(
                     service,
                     campaign(
                         root,
@@ -43,7 +100,7 @@ def test_two_worker_update_matches_combined_single_worker_batch() -> None:
                         workers=["worker-1", "worker-2"],
                     ),
                 )
-                combined = run_campaign(
+                combined = _run_campaign_observed(
                     service,
                     campaign(
                         root,
@@ -117,6 +174,96 @@ def test_remote_cas_binding_uses_digest_as_portable_base_identity() -> None:
             "digest": digest,
             "logicalPath": None,
         }
+
+
+def test_session_identity_is_persisted_before_create_request_and_cleanup_is_exact(
+    tmp_path: Path,
+) -> None:
+    stored: dict[str, dict[str, object]] = {}
+
+    def persist(
+        kind: str,
+        entity_id: str,
+        payload: dict[str, object],
+        expected_generation: int | None,
+    ) -> dict[str, object]:
+        assert kind == "worker-session"
+        previous = stored.get(entity_id)
+        assert expected_generation == (previous or {}).get("generation")
+        result = dict(payload)
+        result["generation"] = int((previous or {}).get("generation", 0)) + 1
+        stored[entity_id] = result
+        return result
+
+    class LostCreateReplyWorker:
+        descriptor = SimpleNamespace(
+            worker_id="worker-1",
+            requested_backend="cpu",
+            effective_backend="cpu",
+            fallback_reason=None,
+        )
+
+        def json(
+            self, method: str, path: str, payload: dict[str, object]
+        ) -> dict[str, object]:
+            session_id = "job-a1-worker-1"
+            observation = stored[session_id]
+            assert method == "POST"
+            assert path == "/v1/sessions"
+            assert payload["sessionId"] == session_id
+            assert observation["sessionId"] == session_id
+            assert observation["createState"] == "dispatched"
+            raise TrainerError(
+                "reply lost", code="worker_unavailable", status=503
+            )
+
+    server = object.__new__(ParameterServer)
+    server.campaign = campaign(
+        tmp_path,
+        tmp_path / "model",
+        campaign_id="session-observation",
+        version="v1",
+        workers=["worker-1"],
+    )
+    server.job = TrainingJob(
+        jobId="job", campaignId="session-observation", facetId="one", candidateId="default"
+    )
+    server.attempt = TrainingAttempt(
+        attemptId="job-a1", jobId="job", number=1, cohort=["worker-1"]
+    )
+    server.workers = [LostCreateReplyWorker()]
+    server.persist = persist
+    server.artifact_bindings = []
+    server.session_ids = {}
+    server.session_summaries = {}
+    server.session_observations = {}
+    server._worker_training_config = lambda: {}  # type: ignore[method-assign]
+
+    with pytest.raises(TrainerError) as lost:
+        server._create_sessions()
+    assert lost.value.code == "worker_unavailable"
+    assert server.session_ids == {"worker-1": "job-a1-worker-1"}
+
+    invalid = server.record_session_cleanup(
+        "worker-1",
+        response={
+            "id": "different-session",
+            "deleted": True,
+            "artifactsRetained": True,
+        },
+    )
+    assert invalid["cleanupState"] == "outcome-unknown"
+    assert invalid["cleanupError"]["code"] == "worker_session_delete_invalid_ack"
+    exact = server.record_session_cleanup(
+        "worker-1",
+        response={
+            "id": "job-a1-worker-1",
+            "deleted": True,
+            "artifactsRetained": True,
+        },
+    )
+    assert exact["cleanupState"] == "acknowledged"
+    assert "cleanupError" not in exact
 
 
 def test_checkpoint_metrics_survive_a_resumed_completed_attempt() -> None:

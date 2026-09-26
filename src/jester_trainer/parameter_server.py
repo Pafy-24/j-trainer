@@ -72,6 +72,7 @@ class ParameterServer:
         self.start_round = 0
         self.session_ids: dict[str, str] = {}
         self.session_summaries: dict[str, dict[str, Any]] = {}
+        self.session_observations: dict[str, dict[str, Any]] = {}
         self.losses: list[float] = []
         self.round_durations: list[float] = []
         self.worker_wait_seconds: dict[str, float] = {
@@ -248,6 +249,15 @@ class ParameterServer:
         for worker in self.workers:
             worker_id = worker.descriptor.worker_id
             session_id = f"{self.attempt.attempt_id}-{worker_id}"
+            # The identity is durable before the request.  A lost POST reply
+            # can therefore be cleaned up and cannot disappear from the
+            # cancellation/recovery audit trail.
+            self.session_ids[worker_id] = session_id
+            self._record_session_observation(
+                worker_id,
+                create_state="dispatched",
+                cleanup_state="pending",
+            )
             payload = {
                 "schemaVersion": "mi-worker-task-v1",
                 "sessionId": session_id,
@@ -264,8 +274,17 @@ class ParameterServer:
                 },
             }
             summary = worker.json("POST", "/v1/sessions", payload)
-            self.session_ids[worker_id] = session_id
+            if summary.get("id") != session_id:
+                raise TrainerError(
+                    f"Worker {worker_id} acknowledged a different session identity",
+                    code="worker_session_identity_mismatch",
+                    status=502,
+                )
             self.session_summaries[worker_id] = summary
+            self._record_session_observation(
+                worker_id,
+                create_state="acknowledged",
+            )
         tensor_sets = {
             sha256_json(summary["engine"]["tensorSpecs"])
             for summary in self.session_summaries.values()
@@ -278,6 +297,82 @@ class ParameterServer:
                 "Synchronous cohort workers disagree on base binding or child tensor structure",
                 code="heterogeneous_cohort",
             )
+
+    def record_session_cleanup(
+        self,
+        worker_id: str,
+        *,
+        response: dict[str, Any] | None = None,
+        error: BaseException | None = None,
+    ) -> dict[str, Any]:
+        session_id = self.session_ids[worker_id]
+        if response is not None:
+            exact = (
+                response.get("id") == session_id
+                and response.get("deleted") is True
+                and response.get("artifactsRetained") is True
+            )
+            if not exact:
+                error = TrainerError(
+                    f"Worker {worker_id} returned an invalid session deletion acknowledgement",
+                    code="worker_session_delete_invalid_ack",
+                    status=502,
+                )
+        if error is None:
+            return self._record_session_observation(
+                worker_id,
+                cleanup_state="acknowledged",
+                cleanup_error=None,
+            )
+        return self._record_session_observation(
+            worker_id,
+            cleanup_state="outcome-unknown",
+            cleanup_error={
+                "code": getattr(error, "code", "worker_session_delete_failed"),
+                "detail": f"{type(error).__name__}: {error}",
+            },
+        )
+
+    def _record_session_observation(
+        self,
+        worker_id: str,
+        *,
+        create_state: str | None = None,
+        cleanup_state: str | None = None,
+        cleanup_error: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        session_id = self.session_ids[worker_id]
+        previous = self.session_observations.get(worker_id)
+        if previous is None:
+            payload: dict[str, Any] = {
+                "schemaVersion": "jester-trainer-worker-session-observation-v1",
+                "kind": "WorkerSessionObservation",
+                "id": session_id,
+                "campaignId": self.campaign.metadata.id,
+                "jobId": self.job.job_id,
+                "attemptId": self.attempt.attempt_id,
+                "workerId": worker_id,
+                "sessionId": session_id,
+                "createState": create_state or "dispatched",
+                "cleanupState": cleanup_state or "pending",
+            }
+            expected_generation = None
+        else:
+            payload = dict(previous)
+            if create_state is not None:
+                payload["createState"] = create_state
+            if cleanup_state is not None:
+                payload["cleanupState"] = cleanup_state
+            expected_generation = int(previous["generation"])
+        if cleanup_error is None:
+            payload.pop("cleanupError", None)
+        else:
+            payload["cleanupError"] = cleanup_error
+        stored = self.persist(
+            "worker-session", session_id, payload, expected_generation
+        )
+        self.session_observations[worker_id] = stored
+        return stored
 
     def _worker_training_config(self) -> dict[str, Any]:
         config = copy.deepcopy(self.mi_config)

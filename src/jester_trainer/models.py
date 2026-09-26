@@ -25,6 +25,7 @@ class CampaignState(str, Enum):
     QUEUED = "queued"
     RUNNING = "running"
     PAUSED = "paused"
+    CANCELLING = "cancelling"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -298,7 +299,9 @@ class TrainingAttempt(APIModel):
     job_id: str = Field(alias="jobId")
     number: int = Field(ge=1)
     cohort: list[str]
-    state: Literal["running", "succeeded", "failed", "cancelled"] = "running"
+    state: Literal[
+        "running", "succeeded", "failed", "cancelled", "reconciliation-required"
+    ] = "running"
     started_at: str = Field(default_factory=utc_now, alias="startedAt")
     completed_at: str | None = Field(default=None, alias="completedAt")
     error: dict[str, Any] | None = None

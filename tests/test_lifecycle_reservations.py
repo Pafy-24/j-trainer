@@ -3,6 +3,7 @@ from __future__ import annotations
 import multiprocessing
 import os
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -15,7 +16,8 @@ from jester_trainer.api import create_app
 from jester_trainer.channel_sessions import ManagedChannelContext, ManagedChannelGuard
 from jester_trainer.config import Settings
 from jester_trainer.errors import ConflictError, TrainerError
-from jester_trainer.models import CampaignState
+from jester_trainer.models import CampaignState, Operation, TrainingAttempt, TrainingJob
+from jester_trainer.parameter_server import ParameterServer
 from jester_trainer.service import TrainerService
 from jester_trainer.workers import WorkerDescriptor
 
@@ -113,6 +115,768 @@ def _crash_during_start(
         service._spawn = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
     service.start_campaign(campaign_id, operation_id=operation_id)
     os._exit(72)
+
+
+def test_cancel_intent_precedes_signal_and_terminal_waits_for_worker_unwind(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "trainer"
+    service = TrainerService(_settings(root))
+    _planned_campaign(service, root, "campaign-cancel")
+    start_operation_id = "engine.trainer." + "1" * 32
+    cancel_operation_id = "engine.trainer.cancel." + "2" * 32
+    actions: list[Any] = []
+    service._spawn = lambda _name, action: actions.append(action)  # type: ignore[method-assign]
+    service.start_campaign("campaign-cancel", operation_id=start_operation_id)
+    controls = service._controls("campaign-cancel")
+    original_set = controls["cancel"].set
+    observed: list[tuple[str, str]] = []
+
+    def observe_set() -> None:
+        reservation = service.store.campaign_cancel_reservation("campaign-cancel")
+        observed.append(
+            (
+                str(reservation and reservation["phase"]),
+                service.get_campaign("campaign-cancel").state,
+            )
+        )
+        original_set()
+        actions[0]()
+
+    controls["cancel"].set = observe_set  # type: ignore[method-assign]
+    requested = service.cancel_campaign(
+        "campaign-cancel",
+        start_operation_id=start_operation_id,
+        cancel_operation_id=cancel_operation_id,
+    )
+
+    assert observed == [("signal-committed", CampaignState.CANCELLING)]
+    assert requested["state"] == "succeeded"
+
+    execution = service.campaign_execution(
+        "campaign-cancel", operation_id=start_operation_id
+    )
+    assert execution["campaign"]["state"] == "cancelled"
+    assert execution["operation"]["state"] == "cancelled"
+    assert execution["cancellation"]["phase"] == "terminal"
+    assert execution["cancellation"]["operation"]["state"] == "succeeded"
+    assert all(item["state"] == "cancelled" for item in execution["jobs"])
+    service.close()
+
+
+def test_cancel_exact_replay_and_conflicting_operation_are_fenced(tmp_path: Path) -> None:
+    root = tmp_path / "trainer"
+    service = TrainerService(_settings(root))
+    _planned_campaign(service, root, "campaign-replay")
+    start_operation_id = "engine.trainer." + "3" * 32
+    cancel_operation_id = "engine.trainer.cancel." + "4" * 32
+    service._spawn = lambda _name, _action: None  # type: ignore[method-assign]
+    service.start_campaign("campaign-replay", operation_id=start_operation_id)
+
+    first = service.cancel_campaign(
+        "campaign-replay",
+        start_operation_id=start_operation_id,
+        cancel_operation_id=cancel_operation_id,
+    )
+    replay = service.cancel_campaign(
+        "campaign-replay",
+        start_operation_id=start_operation_id,
+        cancel_operation_id=cancel_operation_id,
+    )
+    assert replay == first
+
+    with pytest.raises(ConflictError) as conflict:
+        service.cancel_campaign(
+            "campaign-replay",
+            start_operation_id=start_operation_id,
+            cancel_operation_id="engine.trainer.cancel." + "5" * 32,
+        )
+    assert conflict.value.code == "campaign_cancel_reserved"
+    service.close()
+
+
+def test_natural_terminal_before_cancel_is_preserved(tmp_path: Path) -> None:
+    root = tmp_path / "trainer"
+    service = TrainerService(_settings(root))
+    _planned_campaign(service, root, "campaign-late")
+    start_operation_id = "engine.trainer." + "6" * 32
+    service._spawn = lambda _name, _action: None  # type: ignore[method-assign]
+    service.start_campaign("campaign-late", operation_id=start_operation_id)
+    assert service.store.settle_campaign_succeeded(
+        "campaign-late",
+        start_operation_id,
+        {"campaignId": "campaign-late", "results": []},
+        controller_id=service._controller_lease.instance_id,
+    )
+
+    with pytest.raises(ConflictError) as conflict:
+        service.cancel_campaign(
+            "campaign-late",
+            start_operation_id=start_operation_id,
+            cancel_operation_id="engine.trainer.cancel." + "7" * 32,
+        )
+    assert conflict.value.code == "campaign_cancel_too_late"
+    assert service.get_campaign("campaign-late").state == CampaignState.SUCCEEDED
+    assert service.get_operation(start_operation_id)["state"] == "succeeded"
+    assert service.store.campaign_cancel_reservation("campaign-late") is None
+    service.close()
+
+
+def test_reopen_fences_ambiguous_cancel_without_resignal_or_terminal_overwrite(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "trainer"
+    service = TrainerService(_settings(root))
+    _planned_campaign(service, root, "campaign-unknown")
+    start_operation_id = "engine.trainer." + "8" * 32
+    cancel_operation_id = "engine.trainer.cancel." + "9" * 32
+    service._spawn = lambda _name, _action: None  # type: ignore[method-assign]
+    service.start_campaign("campaign-unknown", operation_id=start_operation_id)
+    service.cancel_campaign(
+        "campaign-unknown",
+        start_operation_id=start_operation_id,
+        cancel_operation_id=cancel_operation_id,
+    )
+    stale_controller = service._controller_lease.instance_id
+    service.close()
+
+    reopened = TrainerService(_settings(root))
+    execution = reopened.campaign_execution(
+        "campaign-unknown", operation_id=start_operation_id
+    )
+    assert execution["campaign"]["state"] == "cancelling"
+    assert execution["operation"]["state"] == "reconciliation-required"
+    assert execution["cancellation"]["phase"] == "reconciliation-required"
+    assert execution["cancellation"]["operation"]["state"] == "reconciliation-required"
+    assert not reopened.store.settle_campaign_cancelled(
+        "campaign-unknown",
+        start_operation_id,
+        controller_id=stale_controller,
+    )
+    assert not reopened.store.settle_campaign_failed(
+        "campaign-unknown",
+        start_operation_id,
+        {"code": "stale", "detail": "stale writer"},
+        controller_id=stale_controller,
+    )
+    assert reopened.get_operation(start_operation_id)["state"] == "reconciliation-required"
+    reopened.close()
+
+
+def test_managed_cancel_requires_exact_ids_and_returns_operation_receipt(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "trainer"
+    service = TrainerService(_settings(root))
+    service.store.bind_campaign_owner(
+        "campaign-api-cancel", project_id="project-a", deployment_id="deployment-a"
+    )
+    _planned_campaign(service, root, "campaign-api-cancel")
+    service._spawn = lambda _name, _action: None  # type: ignore[method-assign]
+    start_operation_id = "engine.trainer." + "a" * 32
+    cancel_operation_id = "engine.trainer.cancel." + "b" * 32
+    headers = {
+        "X-Jester-Component-Session": "owner-a",
+        "Idempotency-Key": "cancel-api",
+    }
+    with TestClient(
+        create_app(
+            service,
+            managed_channel_guard=_managed_guard(),
+            require_managed_session=True,
+        )
+    ) as client:
+        started = client.post(
+            "/v1/campaigns/campaign-api-cancel/actions/start",
+            headers={**headers, "Idempotency-Key": "start-api"},
+            json={"operationId": start_operation_id},
+        )
+        invalid = client.post(
+            "/v1/campaigns/campaign-api-cancel/actions/cancel",
+            headers=headers,
+            json={"startOperationId": start_operation_id},
+        )
+        cancelled = client.post(
+            "/v1/campaigns/campaign-api-cancel/actions/cancel",
+            headers=headers,
+            json={
+                "startOperationId": start_operation_id,
+                "cancelOperationId": cancel_operation_id,
+            },
+        )
+        assert started.status_code == 202
+        assert invalid.status_code == 422
+        assert cancelled.status_code == 202
+        assert cancelled.json()["operationId"] == cancel_operation_id
+        assert cancelled.json()["action"] == "campaign.cancel"
+        assert cancelled.json()["state"] == "running"
+
+
+def test_cancel_rejects_wrong_controller_and_reconciliation_start(tmp_path: Path) -> None:
+    root = tmp_path / "trainer"
+    owner = TrainerService(_settings(root))
+    peer = TrainerService(_settings(root))
+    _planned_campaign(owner, root, "campaign-owner-fence")
+    start_operation_id = "engine.trainer." + "c" * 32
+    owner._spawn = lambda _name, _action: None  # type: ignore[method-assign]
+    owner.start_campaign("campaign-owner-fence", operation_id=start_operation_id)
+
+    with pytest.raises(ConflictError) as wrong_owner:
+        peer.cancel_campaign(
+            "campaign-owner-fence",
+            start_operation_id=start_operation_id,
+            cancel_operation_id="engine.trainer.cancel." + "d" * 32,
+        )
+    assert wrong_owner.value.code == "campaign_cancel_start_not_active"
+    assert owner.store.campaign_cancel_reservation("campaign-owner-fence") is None
+
+    assert owner.store.mark_campaign_start_reconciliation_required(
+        "campaign-owner-fence",
+        start_operation_id,
+        controller_id=owner._controller_lease.instance_id,
+        reason="test fence",
+    )
+    with pytest.raises(ConflictError) as reconciliation:
+        owner.cancel_campaign(
+            "campaign-owner-fence",
+            start_operation_id=start_operation_id,
+            cancel_operation_id="engine.trainer.cancel." + "e" * 32,
+        )
+    assert reconciliation.value.code == "campaign_cancel_start_not_active"
+    assert owner.store.campaign_cancel_reservation("campaign-owner-fence") is None
+    peer.close()
+    owner.close()
+
+
+def test_cancel_settlement_uses_exact_campaign_job_ownership(tmp_path: Path) -> None:
+    root = tmp_path / "trainer"
+    service = TrainerService(_settings(root))
+    _planned_campaign(service, root, "foo")
+    own_job = TrainingJob(
+        jobId="shared-looking-id", campaignId="foo", facetId="one", candidateId="default"
+    )
+    foreign_job = TrainingJob(
+        jobId="foo-bar-job", campaignId="foo-bar", facetId="one", candidateId="default"
+    )
+    service.store.put_entity("job", own_job.job_id, own_job.api_dict())
+    service.store.put_entity("job", foreign_job.job_id, foreign_job.api_dict())
+    own_attempt = TrainingAttempt(
+        attemptId="attempt-own", jobId=own_job.job_id, number=1, cohort=[]
+    )
+    foreign_attempt = TrainingAttempt(
+        attemptId="attempt-foreign", jobId=foreign_job.job_id, number=1, cohort=[]
+    )
+    service.store.put_entity("attempt", own_attempt.attempt_id, own_attempt.api_dict())
+    service.store.put_entity("attempt", foreign_attempt.attempt_id, foreign_attempt.api_dict())
+    service._spawn = lambda _name, _action: None  # type: ignore[method-assign]
+    start_operation_id = "engine.trainer." + "f" * 32
+    service.start_campaign("foo", operation_id=start_operation_id)
+    service.cancel_campaign(
+        "foo",
+        start_operation_id=start_operation_id,
+        cancel_operation_id="engine.trainer.cancel." + "0" * 32,
+    )
+    assert service.store.settle_campaign_cancelled(
+        "foo", start_operation_id, controller_id=service._controller_lease.instance_id
+    )
+    assert service.store.get_entity("attempt", "attempt-own")["state"] == "cancelled"
+    assert service.store.get_entity("attempt", "attempt-foreign")["state"] == "running"
+    service.close()
+
+
+def test_terminal_success_cannot_be_replaced_by_late_failure(tmp_path: Path) -> None:
+    root = tmp_path / "trainer"
+    service = TrainerService(_settings(root))
+    _planned_campaign(service, root, "campaign-terminal")
+    service._spawn = lambda _name, _action: None  # type: ignore[method-assign]
+    start_operation_id = "engine.trainer." + "1" * 32
+    service.start_campaign("campaign-terminal", operation_id=start_operation_id)
+    assert service.store.settle_campaign_succeeded(
+        "campaign-terminal",
+        start_operation_id,
+        {"campaignId": "campaign-terminal", "results": []},
+        controller_id=service._controller_lease.instance_id,
+    )
+    assert not service.store.settle_campaign_failed(
+        "campaign-terminal",
+        start_operation_id,
+        {"code": "late_event_failure", "detail": "event write failed"},
+        controller_id=service._controller_lease.instance_id,
+    )
+    assert service.get_campaign("campaign-terminal").state == CampaignState.SUCCEEDED
+    assert service.get_operation(start_operation_id)["state"] == "succeeded"
+    service.close()
+
+
+def test_worker_settles_cancel_between_reservation_and_signal_commit(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "trainer"
+    service = TrainerService(_settings(root))
+    _planned_campaign(service, root, "campaign-reserve-signal")
+    start_operation_id = "engine.trainer." + "4" * 32
+    cancel_operation_id = "engine.trainer.cancel." + "5" * 32
+    actions: list[Any] = []
+    service._spawn = lambda _name, action: actions.append(action)  # type: ignore[method-assign]
+    service.start_campaign(
+        "campaign-reserve-signal", operation_id=start_operation_id
+    )
+    operation = Operation(
+        operationId=cancel_operation_id,
+        action="campaign.cancel",
+        targetId="campaign-reserve-signal",
+    )
+    _, created = service.store.reserve_campaign_cancel(
+        "campaign-reserve-signal",
+        start_operation_id,
+        operation.api_dict(),
+        controller_id=service._controller_lease.instance_id,
+    )
+    assert created
+    assert (
+        service.store.campaign_cancel_reservation("campaign-reserve-signal")["phase"]
+        == "requested"
+    )
+
+    actions[0]()
+
+    canonical = service.store.mark_campaign_cancel_signal_committed(
+        "campaign-reserve-signal",
+        cancel_operation_id,
+        controller_id=service._controller_lease.instance_id,
+    )
+    assert canonical["state"] == "succeeded"
+    assert service.get_campaign("campaign-reserve-signal").state == "cancelled"
+    assert service.get_operation(start_operation_id)["state"] == "cancelled"
+    assert service.store.campaign_cancel_reservation("campaign-reserve-signal")[
+        "phase"
+    ] == "terminal"
+    service.close()
+
+
+def test_lost_start_fence_never_reaches_worker_pool_or_failure_event(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "trainer"
+    service = TrainerService(_settings(root))
+    _planned_campaign(service, root, "campaign-lost-fence")
+    start_operation_id = "engine.trainer." + "6" * 32
+    actions: list[Any] = []
+    service._spawn = lambda _name, action: actions.append(action)  # type: ignore[method-assign]
+    service.start_campaign("campaign-lost-fence", operation_id=start_operation_id)
+    assert service.store.mark_campaign_start_reconciliation_required(
+        "campaign-lost-fence",
+        start_operation_id,
+        controller_id=service._controller_lease.instance_id,
+        reason="deterministic lost-fence test",
+    )
+    service.pool.select = lambda *_args, **_kwargs: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        AssertionError("worker pool must not be reached after a lost start fence")
+    )
+    emitted: list[str] = []
+    service._event = lambda event_type, **_kwargs: emitted.append(event_type)  # type: ignore[method-assign]
+
+    actions[0]()
+
+    assert service.get_operation(start_operation_id)["state"] == "reconciliation-required"
+    assert "CAMPAIGN_FAILED" not in emitted
+    service.close()
+
+
+def test_event_failure_after_success_does_not_publish_false_failure(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "trainer"
+    service = TrainerService(_settings(root))
+    _planned_campaign(service, root, "campaign-event-race")
+    start_operation_id = "engine.trainer." + "7" * 32
+    actions: list[Any] = []
+    service._spawn = lambda _name, action: actions.append(action)  # type: ignore[method-assign]
+    service.pool.select = lambda *_args, **_kwargs: []  # type: ignore[method-assign]
+    emitted: list[str] = []
+
+    def fail_success_event(event_type: str, **_kwargs: Any) -> None:
+        emitted.append(event_type)
+        if event_type == "CAMPAIGN_SUCCEEDED":
+            raise OSError("event sink unavailable")
+
+    service._event = fail_success_event  # type: ignore[method-assign]
+    service.start_campaign("campaign-event-race", operation_id=start_operation_id)
+
+    actions[0]()
+
+    assert service.get_campaign("campaign-event-race").state == "succeeded"
+    assert service.get_operation(start_operation_id)["state"] == "succeeded"
+    assert emitted == ["CAMPAIGN_SUCCEEDED"]
+    service.close()
+
+
+def test_failed_terminal_cancel_cannot_be_reclassified_as_cancelled(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "trainer"
+    service = TrainerService(_settings(root))
+    _planned_campaign(service, root, "campaign-cancel-failed")
+    start_operation_id = "engine.trainer." + "8" * 32
+    cancel_operation_id = "engine.trainer.cancel." + "9" * 32
+    service._spawn = lambda _name, _action: None  # type: ignore[method-assign]
+    service.start_campaign("campaign-cancel-failed", operation_id=start_operation_id)
+    service.cancel_campaign(
+        "campaign-cancel-failed",
+        start_operation_id=start_operation_id,
+        cancel_operation_id=cancel_operation_id,
+    )
+    assert service.store.settle_campaign_failed(
+        "campaign-cancel-failed",
+        start_operation_id,
+        {"code": "worker_failed", "detail": "natural failure won"},
+        controller_id=service._controller_lease.instance_id,
+    )
+
+    assert not service.store.settle_campaign_cancelled(
+        "campaign-cancel-failed",
+        start_operation_id,
+        controller_id=service._controller_lease.instance_id,
+    )
+    with pytest.raises(ConflictError) as terminal:
+        service.store.mark_campaign_cancel_signal_committed(
+            "campaign-cancel-failed",
+            cancel_operation_id,
+            controller_id=service._controller_lease.instance_id,
+        )
+    assert terminal.value.code == "campaign_cancel_terminal_conflict"
+    assert service.get_campaign("campaign-cancel-failed").state == "failed"
+    assert service.get_operation(start_operation_id)["state"] == "failed"
+    assert service.get_operation(cancel_operation_id)["state"] == "failed"
+    service.close()
+
+
+def test_lost_worker_reply_and_cleanup_require_reconciliation_without_retry(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "trainer"
+    service = TrainerService(_settings(root))
+    _planned_campaign(service, root, "campaign-worker-unknown")
+    job = TrainingJob(
+        jobId="campaign-worker-unknown-job",
+        campaignId="campaign-worker-unknown",
+        facetId="tiny-coder",
+        candidateId="default",
+    )
+    service.store.put_entity("job", job.job_id, job.api_dict())
+    calls: list[tuple[str, str]] = []
+
+    class AmbiguousWorker:
+        descriptor = WorkerDescriptor(
+            worker_id="worker-1",
+            node_id="worker-1",
+            instance_id="worker-1-instance",
+            base_url="http://127.0.0.1:1",
+            transport="local-loopback",
+            channel_id="trainer-to-worker-1",
+            protocol="http-json+binary",
+            resumable=True,
+            requested_backend="cpu",
+            effective_backend="cpu",
+        )
+
+        def json(self, method: str, path: str, _payload: Any = None) -> dict[str, Any]:
+            calls.append((method, path))
+            detail = "create reply lost" if method == "POST" else "delete reply lost"
+            raise TrainerError(detail, code="worker_unavailable", status=503)
+
+    worker = AmbiguousWorker()
+    service.pool.select = lambda *_args, **_kwargs: [worker]  # type: ignore[method-assign]
+    actions: list[Any] = []
+    service._spawn = lambda _name, action: actions.append(action)  # type: ignore[method-assign]
+    start_operation_id = "engine.trainer." + "a" * 32
+    service.start_campaign(
+        "campaign-worker-unknown", operation_id=start_operation_id
+    )
+    actions[0]()
+
+    assert calls == [
+        ("POST", "/v1/sessions"),
+        ("DELETE", f"/v1/sessions/{job.job_id}-a1-worker-1"),
+    ]
+    assert service.get_operation(start_operation_id)["state"] == "reconciliation-required"
+    assert service.get_campaign("campaign-worker-unknown").state == "recovering"
+    assert service.get_job(job.job_id)["state"] == "running"
+    attempt = service.store.get_entity("attempt", f"{job.job_id}-a1")
+    assert attempt["state"] == "reconciliation-required"
+    assert attempt["error"]["cause"]["code"] == "worker_unavailable"
+    observation = service.store.get_entity(
+        "worker-session", f"{job.job_id}-a1-worker-1"
+    )
+    assert observation["createState"] == "dispatched"
+    assert observation["cleanupState"] == "outcome-unknown"
+    assert not any(
+        event["type"] in {"CAMPAIGN_FAILED", "CAMPAIGN_CANCELLED"}
+        for event in service.store.list_events()
+    )
+    service.close()
+
+
+def test_parameter_server_safe_frontier_can_settle_cancel_with_lost_delete_reply(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "trainer"
+    service = TrainerService(_settings(root))
+    _planned_campaign(service, root, "campaign-safe-frontier")
+    job = TrainingJob(
+        jobId="campaign-safe-frontier-job",
+        campaignId="campaign-safe-frontier",
+        facetId="tiny-coder",
+        candidateId="default",
+    )
+    service.store.put_entity("job", job.job_id, job.api_dict())
+    calls: list[tuple[str, str]] = []
+
+    class SafeBoundaryWorker:
+        descriptor = WorkerDescriptor(
+            worker_id="worker-1",
+            node_id="worker-1",
+            instance_id="worker-1-instance",
+            base_url="http://127.0.0.1:1",
+            transport="local-loopback",
+            channel_id="trainer-to-worker-1",
+            protocol="http-json+binary",
+            resumable=True,
+            requested_backend="cpu",
+            effective_backend="cpu",
+        )
+
+        def json(self, method: str, path: str, payload: Any = None) -> dict[str, Any]:
+            calls.append((method, path))
+            if method == "POST":
+                return {
+                    "id": payload["sessionId"],
+                    "weightVersion": "worker-init",
+                    "weightSha256": "0" * 64,
+                    "engine": {"tensorSpecs": {}, "base": {}},
+                }
+            raise TrainerError(
+                "delete reply lost", code="worker_unavailable", status=503
+            )
+
+        def download(
+            self,
+            _path: str,
+            destination: Path,
+            **_kwargs: Any,
+        ) -> Path:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(b"not-read-in-this-test")
+            return destination
+
+    worker = SafeBoundaryWorker()
+    service.pool.select = lambda *_args, **_kwargs: [worker]  # type: ignore[method-assign]
+    actions: list[Any] = []
+    service._spawn = lambda _name, action: actions.append(action)  # type: ignore[method-assign]
+    start_operation_id = "engine.trainer." + "b" * 32
+    cancel_operation_id = "engine.trainer.cancel." + "c" * 32
+
+    def save_weights(server: ParameterServer, version: str) -> Path:
+        path = server.output / "coordinator" / f"{version}.safetensors"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"weights")
+        return path
+
+    def cancel_at_safe_boundary(
+        _server: ParameterServer, _path: Path, _version: str
+    ) -> None:
+        service.cancel_campaign(
+            "campaign-safe-frontier",
+            start_operation_id=start_operation_id,
+            cancel_operation_id=cancel_operation_id,
+        )
+
+    with (
+        patch.object(ParameterServer, "_initialize_parameters", lambda *_args: None),
+        patch.object(ParameterServer, "_build_optimizer", lambda *_args: None),
+        patch.object(ParameterServer, "_resume_if_requested", lambda *_args: None),
+        patch.object(ParameterServer, "_save_coordinator_weights", save_weights),
+        patch.object(ParameterServer, "_publish_weights", cancel_at_safe_boundary),
+    ):
+        service.start_campaign(
+            "campaign-safe-frontier", operation_id=start_operation_id
+        )
+        actions[0]()
+
+    assert service.get_campaign("campaign-safe-frontier").state == "cancelled"
+    assert service.get_operation(start_operation_id)["state"] == "cancelled"
+    assert service.get_operation(cancel_operation_id)["state"] == "succeeded"
+    attempt = service.store.get_entity("attempt", f"{job.job_id}-a1")
+    assert attempt["state"] == "cancelled"
+    observation = service.store.get_entity(
+        "worker-session", f"{job.job_id}-a1-worker-1"
+    )
+    assert observation["createState"] == "acknowledged"
+    assert observation["cleanupState"] == "outcome-unknown"
+    assert calls == [
+        ("POST", "/v1/sessions"),
+        ("DELETE", f"/v1/sessions/{job.job_id}-a1-worker-1"),
+    ]
+    service.close()
+
+
+@pytest.mark.parametrize(
+    ("other_code", "other_first"),
+    [
+        ("remote_session_outcome_unknown", False),
+        ("remote_session_outcome_unknown", True),
+        ("natural_worker_failure", False),
+        ("natural_worker_failure", True),
+    ],
+)
+def test_parallel_job_error_precedence_is_independent_of_completion_order(
+    tmp_path: Path, other_code: str, other_first: bool
+) -> None:
+    root = tmp_path / f"trainer-{other_code}-{other_first}"
+    service = TrainerService(_settings(root))
+    campaign_id = f"campaign-precedence-{other_code}-{other_first}".replace("_", "-")
+    _planned_campaign(service, root, campaign_id)
+    current_campaign = service.get_campaign(campaign_id)
+    independent = current_campaign.model_copy(
+        update={
+            "spec": current_campaign.spec.model_copy(update={"mode": "independent"})
+        }
+    )
+    service.store.put_entity(
+        "campaign",
+        campaign_id,
+        independent.api_dict(),
+        expected_generation=current_campaign.generation,
+    )
+    cancel_job = TrainingJob(
+        jobId=f"{campaign_id}-cancel",
+        campaignId=campaign_id,
+        facetId="tiny-coder",
+        candidateId="default",
+    )
+    other_job = TrainingJob(
+        jobId=f"{campaign_id}-other",
+        campaignId=campaign_id,
+        facetId="tiny-coder",
+        candidateId="default",
+    )
+    for job in (cancel_job, other_job):
+        service.store.put_entity("job", job.job_id, job.api_dict())
+    workers = [
+        type(
+            "ParallelWorker",
+            (),
+            {
+                "descriptor": WorkerDescriptor(
+                    worker_id=f"worker-{index}",
+                    node_id=f"worker-{index}",
+                    instance_id=f"worker-{index}-instance",
+                    base_url="http://127.0.0.1:1",
+                    transport="local-loopback",
+                    channel_id=f"trainer-to-worker-{index}",
+                    protocol="http-json+binary",
+                    resumable=True,
+                    requested_backend="cpu",
+                    effective_backend="cpu",
+                )
+            },
+        )()
+        for index in (1, 2)
+    ]
+    service.pool.select = lambda *_args, **_kwargs: workers  # type: ignore[method-assign]
+    actions: list[Any] = []
+    service._spawn = lambda _name, action: actions.append(action)  # type: ignore[method-assign]
+    start_operation_id = "engine.trainer." + ("d" if other_first else "e") * 32
+    cancel_operation_id = "engine.trainer.cancel." + ("f" if other_first else "0") * 32
+    barrier = threading.Barrier(2)
+
+    def execute_job(_campaign: Any, job: TrainingJob, _workers: Any) -> None:
+        barrier.wait(timeout=5)
+        is_other = job.job_id == other_job.job_id
+        finishes_first = is_other == other_first
+        if not finishes_first:
+            time.sleep(0.1)
+        if is_other:
+            raise TrainerError(
+                f"{other_code} from {job.job_id}",
+                code=other_code,
+                status=503 if other_code == "remote_session_outcome_unknown" else 500,
+            )
+        service.cancel_campaign(
+            campaign_id,
+            start_operation_id=start_operation_id,
+            cancel_operation_id=cancel_operation_id,
+        )
+        raise TrainerError(
+            "clean safe-boundary cancellation",
+            code="campaign_cancelled",
+            status=409,
+            fields={"safeBoundary": True},
+        )
+
+    service._run_job_with_retries = execute_job  # type: ignore[method-assign]
+    service.start_campaign(campaign_id, operation_id=start_operation_id)
+    actions[0]()
+
+    if other_code == "remote_session_outcome_unknown":
+        execution = service.campaign_execution(
+            campaign_id, operation_id=start_operation_id
+        )
+        assert execution["campaign"]["state"] == "cancelling"
+        assert execution["operation"]["state"] == "reconciliation-required"
+        assert execution["cancellation"]["phase"] == "reconciliation-required"
+        assert execution["cancellation"]["operation"]["state"] == "reconciliation-required"
+        error = execution["cancellation"]["operation"]["error"]
+        assert service.store.active_campaign_start(campaign_id) is not None
+    else:
+        assert service.get_campaign(campaign_id).state == "failed"
+        assert service.get_operation(start_operation_id)["state"] == "failed"
+        assert service.get_operation(cancel_operation_id)["state"] == "failed"
+        error = service.get_operation(start_operation_id)["error"]
+    assert [item["jobId"] for item in error["jobErrors"]] == sorted(
+        [cancel_job.job_id, other_job.job_id]
+    )
+    assert {item["code"] for item in error["jobErrors"]} == {
+        "campaign_cancelled",
+        other_code,
+    }
+    service.close()
+
+
+def test_cancel_reservation_atomically_fences_running_transition(tmp_path: Path) -> None:
+    root = tmp_path / "trainer"
+    service = TrainerService(_settings(root))
+    _planned_campaign(service, root, "campaign-start-race")
+    service._spawn = lambda _name, _action: None  # type: ignore[method-assign]
+    start_operation_id = "engine.trainer." + "2" * 32
+    service.start_campaign("campaign-start-race", operation_id=start_operation_id)
+    service.cancel_campaign(
+        "campaign-start-race",
+        start_operation_id=start_operation_id,
+        cancel_operation_id="engine.trainer.cancel." + "3" * 32,
+    )
+    assert not service.store.mark_campaign_start_running(
+        "campaign-start-race",
+        start_operation_id,
+        controller_id=service._controller_lease.instance_id,
+    )
+    assert service.get_campaign("campaign-start-race").state == CampaignState.CANCELLING
+    assert service.get_operation(start_operation_id)["state"] == "queued"
+    service.close()
+
+
+def test_legacy_admin_cancel_without_operation_ids_remains_safe(tmp_path: Path) -> None:
+    root = tmp_path / "trainer"
+    service = TrainerService(_settings(root))
+    _planned_campaign(service, root, "campaign-admin")
+    headers = {"Authorization": f"Bearer {service.token}", "Idempotency-Key": "admin-cancel"}
+    with TestClient(create_app(service)) as client:
+        response = client.post(
+            "/v1/campaigns/campaign-admin/actions/cancel", headers=headers, json={}
+        )
+        assert response.status_code == 202
+        assert response.json()["state"] == "cancelled"
+        assert service.store.campaign_cancel_reservation("campaign-admin") is None
 
 
 def _managed_guard() -> ManagedChannelGuard:
@@ -341,6 +1105,86 @@ def test_close_keeps_controller_lease_while_campaign_thread_is_active(
     release.set()
     for thread in list(service._threads):
         thread.join(timeout=5)
+    service.close()
+
+
+def test_escaped_campaign_runner_is_fenced_as_reconciliation_required(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "trainer"
+    service = TrainerService(_settings(root))
+    _planned_campaign(service, root, "campaign-runner-escaped")
+    actions: list[Any] = []
+    service._spawn = lambda _name, action: actions.append(action)  # type: ignore[method-assign]
+    operation_id = "engine.trainer." + "4" * 32
+    service.start_campaign("campaign-runner-escaped", operation_id=operation_id)
+
+    def escaped(current_operation_id: str, current_campaign_id: str) -> None:
+        assert service.store.mark_campaign_start_running(
+            current_campaign_id,
+            current_operation_id,
+            controller_id=service._controller_lease.instance_id,
+        )
+        raise RuntimeError("runner settlement escaped")
+
+    service._run_campaign = escaped  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="runner settlement escaped"):
+        actions[0]()
+
+    operation = service.get_operation(operation_id)
+    assert operation["state"] == "reconciliation-required"
+    assert operation["error"]["code"] == "campaign_start_outcome_unknown"
+    assert operation["error"]["causeCode"] == "campaign_runner_outcome_unknown"
+    assert operation["error"]["exceptionType"] == "RuntimeError"
+    assert service.get_campaign("campaign-runner-escaped").state == "recovering"
+    service.close()
+
+
+def test_escaped_campaign_runner_during_cancel_fences_both_operations(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "trainer"
+    service = TrainerService(_settings(root))
+    campaign_id = "campaign-cancel-runner-escaped"
+    _planned_campaign(service, root, campaign_id)
+    actions: list[Any] = []
+    service._spawn = lambda _name, action: actions.append(action)  # type: ignore[method-assign]
+    start_operation_id = "engine.trainer." + "5" * 32
+    cancel_operation_id = "engine.trainer.cancel." + "6" * 32
+    service.start_campaign(campaign_id, operation_id=start_operation_id)
+    assert service.store.mark_campaign_start_running(
+        campaign_id,
+        start_operation_id,
+        controller_id=service._controller_lease.instance_id,
+    )
+    service.cancel_campaign(
+        campaign_id,
+        start_operation_id=start_operation_id,
+        cancel_operation_id=cancel_operation_id,
+    )
+
+    def escaped(_operation_id: str, _campaign_id: str) -> None:
+        raise RuntimeError("runner escaped during cancel")
+
+    service._run_campaign = escaped  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="runner escaped during cancel"):
+        actions[0]()
+
+    execution = service.campaign_execution(
+        campaign_id, operation_id=start_operation_id
+    )
+    assert execution["operation"]["state"] == "reconciliation-required"
+    assert execution["operation"]["error"]["causeCode"] == (
+        "campaign_runner_outcome_unknown"
+    )
+    assert execution["cancellation"]["phase"] == "reconciliation-required"
+    assert execution["cancellation"]["operation"]["state"] == (
+        "reconciliation-required"
+    )
+    assert execution["cancellation"]["operation"]["error"]["causeCode"] == (
+        "campaign_runner_outcome_unknown"
+    )
+    assert service.store.active_campaign_start(campaign_id) is not None
     service.close()
 
 

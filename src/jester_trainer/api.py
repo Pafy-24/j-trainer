@@ -57,6 +57,13 @@ def create_app(
             ):
                 operation = "trainer.campaign:start"
                 campaign_id = match.group(1)
+            elif request.method == "POST" and (
+                match := re.fullmatch(
+                    r"/v1/campaigns/([^/]+)/actions/cancel", request.url.path
+                )
+            ):
+                operation = "trainer.campaign:cancel"
+                campaign_id = match.group(1)
             elif request.method == "GET" and (
                 match := re.fullmatch(
                     r"/v1/campaigns/([^/]+)/execution", request.url.path
@@ -296,7 +303,6 @@ def create_app(
             "start": trainer.start_campaign,
             "pause": trainer.pause_campaign,
             "resume": trainer.resume_campaign,
-            "cancel": trainer.cancel_campaign,
         }
         return trainer.idempotent(
             f"campaigns.{action}:{campaign_id}",
@@ -367,10 +373,43 @@ def create_app(
     @app.post("/v1/campaigns/{campaign_id}/actions/cancel", status_code=202, dependencies=secured)
     def cancel_campaign(
         campaign_id: str,
+        request: Request,
         payload: dict[str, Any] = Body(default_factory=dict),
         idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     ) -> dict[str, Any]:
-        return campaign_action(campaign_id, "cancel", payload, idempotency_key)
+        authorize_managed_channel(
+            request, operation="trainer.campaign:cancel", campaign_id=campaign_id
+        )
+        start_operation_id = payload.get("startOperationId")
+        cancel_operation_id = payload.get("cancelOperationId")
+        exact_ids = (
+            isinstance(start_operation_id, str)
+            and re.fullmatch(r"engine\.trainer\.[0-9a-f]{32}", start_operation_id) is not None
+            and isinstance(cancel_operation_id, str)
+            and re.fullmatch(r"engine\.trainer\.cancel\.[0-9a-f]{32}", cancel_operation_id) is not None
+        )
+        if require_managed_session and not exact_ids:
+            raise TrainerError(
+                "Campaign cancel requires exact startOperationId and cancelOperationId",
+                code="cancel_operation_ids_required",
+                status=422,
+            )
+        if not require_managed_session and (start_operation_id is not None or cancel_operation_id is not None) and not exact_ids:
+            raise TrainerError(
+                "Campaign cancel operation identifiers are malformed",
+                code="cancel_operation_ids_required",
+                status=422,
+            )
+        return trainer.idempotent(
+            f"campaigns.cancel:{campaign_id}",
+            idempotency_key,
+            payload,
+            lambda: trainer.cancel_campaign(
+                campaign_id,
+                start_operation_id=start_operation_id if exact_ids else None,
+                cancel_operation_id=cancel_operation_id if exact_ids else None,
+            ),
+        )
 
     @app.get("/v1/campaigns/{campaign_id}/jobs", dependencies=secured)
     def campaign_jobs(campaign_id: str) -> dict[str, Any]:

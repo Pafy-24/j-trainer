@@ -446,7 +446,9 @@ class TrainerService:
         try:
             self._spawn(
                 f"campaign-{campaign_id}",
-                lambda: self._run_campaign(operation.operation_id, campaign_id),
+                lambda: self._run_campaign_guarded(
+                    operation.operation_id, campaign_id
+                ),
             )
         except BaseException:
             self.store.mark_campaign_start_reconciliation_required(
@@ -478,20 +480,65 @@ class TrainerService:
         self._event("CAMPAIGN_RESUMED", campaign_id=campaign_id)
         return self.get_campaign(campaign_id).api_dict()
 
-    def cancel_campaign(self, campaign_id: str) -> dict[str, Any]:
-        campaign = self.get_campaign(campaign_id)
-        if campaign.state in {
-            CampaignState.SUCCEEDED,
-            CampaignState.FAILED,
-            CampaignState.CANCELLED,
-        }:
-            return campaign.api_dict()
-        controls = self._controls(campaign_id)
-        controls["cancel"].set()
-        controls["pause"].clear()
-        self._set_campaign_state(campaign_id, CampaignState.CANCELLED)
-        self._event("CAMPAIGN_CANCEL_REQUESTED", campaign_id=campaign_id)
-        return self.get_campaign(campaign_id).api_dict()
+    def cancel_campaign(
+        self,
+        campaign_id: str,
+        *,
+        start_operation_id: str | None = None,
+        cancel_operation_id: str | None = None,
+    ) -> dict[str, Any]:
+        if start_operation_id is None and cancel_operation_id is None:
+            active = self.store.active_campaign_start(campaign_id)
+            if active is None:
+                cancelled = self.store.cancel_unstarted_campaign(campaign_id)
+                self._event("CAMPAIGN_CANCELLED", campaign_id=campaign_id)
+                return cancelled
+            if active["controllerId"] != self._controller_lease.instance_id:
+                raise ConflictError(
+                    "Active campaign belongs to another controller",
+                    code="campaign_cancel_start_not_active",
+                )
+            start_operation_id = str(active["operationId"])
+            cancel_operation_id = "admin.cancel." + uuid.uuid4().hex
+        if start_operation_id is None or cancel_operation_id is None:
+            raise TrainerError(
+                "Active campaign cancellation requires both operation identifiers",
+                code="cancel_operation_ids_required",
+                status=422,
+            )
+        operation = Operation(
+            operationId=cancel_operation_id,
+            action="campaign.cancel",
+            targetId=campaign_id,
+            state=OperationState.QUEUED,
+            result={"startOperationId": start_operation_id},
+        )
+        receipt, acquired = self.store.reserve_campaign_cancel(
+            campaign_id,
+            start_operation_id,
+            operation.api_dict(),
+            controller_id=self._controller_lease.instance_id,
+        )
+        if not acquired:
+            return receipt
+        running = self.store.mark_campaign_cancel_signal_committed(
+            campaign_id,
+            cancel_operation_id,
+            controller_id=self._controller_lease.instance_id,
+        )
+        if running.get("state") == "running":
+            controls = self._controls(campaign_id)
+            controls["cancel"].set()
+            controls["pause"].clear()
+        self._event(
+            "CAMPAIGN_CANCEL_REQUESTED",
+            campaign_id=campaign_id,
+            data={
+                "startOperationId": start_operation_id,
+                "cancelOperationId": cancel_operation_id,
+            },
+        )
+        return self.store.get_operation(cancel_operation_id)
 
     def campaign_jobs(self, campaign_id: str) -> list[dict[str, Any]]:
         return [
@@ -559,10 +606,24 @@ class TrainerService:
             and (operation_id is None or item.get("operationId") == operation_id)
         ]
         latest = operations[-1] if operations else None
+        cancellation = None
+        reservation = self.store.campaign_cancel_reservation(campaign_id)
+        if reservation is not None and (
+            operation_id is None or reservation["start_operation_id"] == operation_id
+        ):
+            cancellation = {
+                "phase": reservation["phase"],
+                "startOperationId": reservation["start_operation_id"],
+                "cancelOperationId": reservation["cancel_operation_id"],
+                "operation": self.store.get_operation(
+                    reservation["cancel_operation_id"]
+                ),
+            }
         return {
             "schemaVersion": "jester-trainer-campaign-execution-v1",
             "campaign": campaign.api_dict(),
             "operation": latest,
+            "cancellation": cancellation,
             "jobs": self.campaign_jobs(campaign_id),
         }
 
@@ -610,12 +671,19 @@ class TrainerService:
 
     def _run_campaign(self, operation_id: str, campaign_id: str) -> None:
         operation = Operation.model_validate(self.store.get_operation(operation_id))
-        operation = operation.model_copy(update={"state": OperationState.RUNNING})
-        self.store.put_operation(
-            operation.api_dict(), controller_id=self._controller_lease.instance_id
-        )
         try:
-            self._set_campaign_state(campaign_id, CampaignState.RUNNING)
+            acquired_running = self.store.mark_campaign_start_running(
+                campaign_id,
+                operation_id,
+                controller_id=self._controller_lease.instance_id,
+            )
+            if not acquired_running:
+                if self.get_campaign(campaign_id).state == CampaignState.CANCELLING:
+                    raise TrainerError(
+                        "Campaign was cancelled", code="campaign_cancelled", status=409
+                    )
+                return
+            self._control_point(campaign_id)
             campaign = self.get_campaign(campaign_id)
             jobs = {
                 item["jobId"]: TrainingJob.model_validate(item)
@@ -665,7 +733,7 @@ class TrainerService:
                     # An explicit full cohort intentionally serializes jobs.
                     first = sorted(ready, key=lambda item: item.job_id)[0]
                     assignments = [(first, list(selected_pool))]
-                errors: list[BaseException] = []
+                errors: list[tuple[str, BaseException]] = []
                 with ThreadPoolExecutor(max_workers=len(assignments)) as executor:
                     futures = {
                         executor.submit(
@@ -683,49 +751,133 @@ class TrainerService:
                             completed.add(job.job_id)
                             jobs.pop(job.job_id, None)
                         except BaseException as exc:
-                            errors.append(exc)
+                            errors.append((job.job_id, exc))
                 if errors:
-                    raise errors[0]
-            self._set_campaign_state(campaign_id, CampaignState.SUCCEEDED)
+                    raise self._campaign_batch_error(errors)
+            self._control_point(campaign_id)
             result = {
                 "campaignId": campaign_id,
                 "results": self.campaign_results(campaign_id),
             }
-            completed_operation = operation.model_copy(
-                update={
-                    "state": OperationState.SUCCEEDED,
-                    "updated_at": utc_now(),
-                    "result": result,
-                }
-            )
-            self.store.put_operation(
-                completed_operation.api_dict(),
+            if not self.store.settle_campaign_succeeded(
+                campaign_id,
+                operation_id,
+                result,
                 controller_id=self._controller_lease.instance_id,
-            )
+            ):
+                self._control_point(campaign_id)
+                raise TrainerError(
+                    "Campaign cancellation won the terminal race",
+                    code="campaign_cancelled",
+                    status=409,
+                )
             self._event("CAMPAIGN_SUCCEEDED", campaign_id=campaign_id)
         except BaseException as exc:
-            current = self.get_campaign(campaign_id)
-            if current.state != CampaignState.CANCELLED:
-                self._set_campaign_state(campaign_id, CampaignState.FAILED)
-            failed = operation.model_copy(
-                update={
-                    "state": OperationState.FAILED,
-                    "updated_at": utc_now(),
-                    "error": {
-                        "code": getattr(exc, "code", "campaign_failed"),
-                        "detail": f"{type(exc).__name__}: {exc}",
-                    },
+            if getattr(exc, "code", None) == "remote_session_outcome_unknown":
+                reservation = self.store.campaign_cancel_reservation(campaign_id)
+                reason = f"{type(exc).__name__}: {exc}"
+                details = {
+                    "jobErrors": list(getattr(exc, "fields", {}).get("jobErrors", []))
                 }
+                self.store.mark_campaign_start_reconciliation_required(
+                    campaign_id,
+                    operation_id,
+                    controller_id=self._controller_lease.instance_id,
+                    reason=reason,
+                    details=details,
+                )
+                self._event(
+                    "CAMPAIGN_RECONCILIATION_REQUIRED",
+                    campaign_id=campaign_id,
+                    severity="error",
+                    data={
+                        "code": "remote_session_outcome_unknown",
+                        "detail": reason,
+                        **details,
+                    },
+                )
+                return
+            if getattr(exc, "code", None) == "campaign_cancelled":
+                if self.store.settle_campaign_cancelled(
+                    campaign_id,
+                    operation_id,
+                    controller_id=self._controller_lease.instance_id,
+                ):
+                    self._event("CAMPAIGN_CANCELLED", campaign_id=campaign_id)
+                    return
+            error = {
+                "code": getattr(exc, "code", "campaign_failed"),
+                "detail": f"{type(exc).__name__}: {exc}",
+            }
+            job_errors = getattr(exc, "fields", {}).get("jobErrors")
+            if job_errors:
+                error["jobErrors"] = list(job_errors)
+            applied = self.store.settle_campaign_failed(
+                campaign_id,
+                operation_id,
+                error,
+                controller_id=self._controller_lease.instance_id,
             )
-            self.store.put_operation(
-                failed.api_dict(), controller_id=self._controller_lease.instance_id
-            )
+            if not applied:
+                return
             self._event(
                 "CAMPAIGN_FAILED",
                 campaign_id=campaign_id,
                 severity="error",
-                data=failed.error or {},
+                data=error,
             )
+
+    def _run_campaign_guarded(self, operation_id: str, campaign_id: str) -> None:
+        """Fence an exception that escapes the normal settlement path."""
+
+        try:
+            self._run_campaign(operation_id, campaign_id)
+        except BaseException as exc:
+            self.store.mark_campaign_start_reconciliation_required(
+                campaign_id,
+                operation_id,
+                controller_id=self._controller_lease.instance_id,
+                reason=(
+                    "Campaign runner exited before it could prove a terminal "
+                    f"receipt: {type(exc).__name__}: {exc}"
+                ),
+                details={
+                    "causeCode": "campaign_runner_outcome_unknown",
+                    "exceptionType": type(exc).__name__,
+                },
+            )
+            raise
+
+    @staticmethod
+    def _campaign_batch_error(
+        errors: list[tuple[str, BaseException]],
+    ) -> TrainerError:
+        def precedence(item: tuple[str, BaseException]) -> tuple[int, str]:
+            code = getattr(item[1], "code", "campaign_failed")
+            if code == "remote_session_outcome_unknown":
+                rank = 0
+            elif code == "campaign_cancelled":
+                rank = 2
+            else:
+                rank = 1
+            return rank, item[0]
+
+        ordered = sorted(errors, key=precedence)
+        _job_id, primary = ordered[0]
+        job_errors = [
+            {
+                "jobId": job_id,
+                "code": getattr(error, "code", "campaign_failed"),
+                "detail": f"{type(error).__name__}: {error}",
+            }
+            for job_id, error in sorted(errors, key=lambda item: item[0])
+        ]
+        return TrainerError(
+            str(primary),
+            code=getattr(primary, "code", "campaign_failed"),
+            status=int(getattr(primary, "status", 500)),
+            fields={"jobErrors": job_errors},
+        )
 
     def _run_job_with_retries(
         self,
@@ -747,6 +899,11 @@ class TrainerService:
                 )
             except BaseException as exc:
                 last_error = exc
+                if getattr(exc, "code", None) in {
+                    "campaign_cancelled",
+                    "remote_session_outcome_unknown",
+                }:
+                    raise
                 self._event(
                     "JOB_ATTEMPT_FAILED",
                     campaign_id=campaign.metadata.id,
@@ -864,8 +1021,12 @@ class TrainerService:
             emit=self._event,
             cancel_check=lambda: self._control_point(campaign.metadata.id),
         )
+        result: Any | None = None
+        execution_error: BaseException | None = None
+        remote_execution_completed = False
         try:
             result = server.run()
+            remote_execution_completed = True
             published_digest = None
             if self.rm.available:
                 published = self.rm.publish_artifact(
@@ -913,46 +1074,119 @@ class TrainerService:
                 job_id=job.job_id,
                 data={"resultId": result_id, "facet": result.facet_reference},
             )
-            return stored_result
+            result = stored_result
         except BaseException as exc:
-            # Keep attempt audit state truthful even when session creation,
-            # model loading, a round, or artifact publication fails.  Leaving
-            # exhausted attempts as ``running`` makes recovery and benchmark
-            # provenance ambiguous after the enclosing job is already failed.
+            execution_error = exc
+        cleanup_unknown: list[dict[str, Any]] = []
+        for worker in workers:
+            worker_id = worker.descriptor.worker_id
+            session_id = server.session_ids.get(worker_id)
+            if not session_id:
+                continue
             try:
-                current_attempt = TrainingAttempt.model_validate(
-                    self.store.get_entity("attempt", attempt_id)
+                response = worker.json("DELETE", f"/v1/sessions/{session_id}")
+                observation = server.record_session_cleanup(
+                    worker_id, response=response
                 )
-                if current_attempt.state == "running":
-                    failed_attempt = current_attempt.model_copy(
-                        update={
-                            "state": "failed",
-                            "completed_at": utc_now(),
-                            "error": {
-                                "code": getattr(exc, "code", "job_failed"),
-                                "detail": f"{type(exc).__name__}: {exc}",
-                            },
-                        }
+            except BaseException as cleanup_error:
+                try:
+                    observation = server.record_session_cleanup(
+                        worker_id, error=cleanup_error
                     )
-                    self.store.put_entity(
-                        "attempt",
-                        attempt_id,
-                        failed_attempt.api_dict(),
-                        expected_generation=current_attempt.generation,
-                    )
-            except BaseException:
-                # Never replace the actual training failure with a secondary
-                # audit-write failure; the job/campaign handler records it.
-                pass
-            raise
-        finally:
-            for worker in workers:
-                session_id = server.session_ids.get(worker.descriptor.worker_id)
-                if session_id:
-                    try:
-                        worker.json("DELETE", f"/v1/sessions/{session_id}")
-                    except TrainerError:
-                        pass
+                except BaseException as persist_error:
+                    observation = {
+                        "workerId": worker_id,
+                        "sessionId": session_id,
+                        "cleanupState": "outcome-unknown",
+                        "cleanupError": {
+                            "code": "worker_session_observation_write_failed",
+                            "detail": f"{type(persist_error).__name__}: {persist_error}",
+                        },
+                    }
+            if observation.get("cleanupState") != "acknowledged":
+                cleanup_unknown.append(observation)
+
+        current_attempt = TrainingAttempt.model_validate(
+            self.store.get_entity("attempt", attempt_id)
+        )
+        safe_frontier = (
+            (
+                getattr(execution_error, "code", None) == "campaign_cancelled"
+                and bool(getattr(execution_error, "fields", {}).get("safeBoundary"))
+            )
+            or remote_execution_completed
+        )
+        if cleanup_unknown and not safe_frontier:
+            if current_attempt.state == "running":
+                cause = None
+                if execution_error is not None:
+                    cause = {
+                        "code": getattr(execution_error, "code", "job_failed"),
+                        "detail": f"{type(execution_error).__name__}: {execution_error}",
+                    }
+                uncertain_attempt = current_attempt.model_copy(
+                    update={
+                        "state": "reconciliation-required",
+                        "error": {
+                            "code": "remote_session_outcome_unknown",
+                            "detail": "One or more worker sessions lack an exact deletion acknowledgement",
+                            "cause": cause,
+                            "sessions": [
+                                {
+                                    "workerId": item.get("workerId"),
+                                    "sessionId": item.get("sessionId"),
+                                    "cleanupError": item.get("cleanupError"),
+                                }
+                                for item in cleanup_unknown
+                            ],
+                        },
+                    }
+                )
+                self.store.put_entity(
+                    "attempt",
+                    attempt_id,
+                    uncertain_attempt.api_dict(),
+                    expected_generation=current_attempt.generation,
+                )
+            raise TrainerError(
+                "Worker session termination could not be proven",
+                code="remote_session_outcome_unknown",
+                status=503,
+                fields={
+                    "sessions": [item.get("sessionId") for item in cleanup_unknown]
+                },
+            )
+
+        if execution_error is not None:
+            if current_attempt.state == "running":
+                cancelled = getattr(execution_error, "code", None) == "campaign_cancelled"
+                completed_attempt = current_attempt.model_copy(
+                    update={
+                        "state": "cancelled" if cancelled else "failed",
+                        "completed_at": utc_now(),
+                        "error": None
+                        if cancelled
+                        else {
+                            "code": getattr(execution_error, "code", "job_failed"),
+                            "detail": f"{type(execution_error).__name__}: {execution_error}",
+                        },
+                    }
+                )
+                self.store.put_entity(
+                    "attempt",
+                    attempt_id,
+                    completed_attempt.api_dict(),
+                    expected_generation=current_attempt.generation,
+                )
+            raise execution_error
+
+        if not isinstance(result, TrainingResult):
+            raise TrainerError(
+                "Training attempt completed without a result",
+                code="training_result_missing",
+                status=500,
+            )
+        return result
 
     def _expand_jobs(self, campaign: Campaign) -> list[TrainingJob]:
         by_facet: dict[str, list[str]] = {}
@@ -1148,14 +1382,24 @@ class TrainerService:
 
     def _control_point(self, campaign_id: str) -> None:
         controls = self._controls(campaign_id)
-        if controls["cancel"].is_set():
+        if (
+            controls["cancel"].is_set()
+            or self.get_campaign(campaign_id).state
+            in {CampaignState.CANCELLING, CampaignState.CANCELLED}
+        ):
             raise TrainerError(
-                "Campaign was cancelled", code="campaign_cancelled", status=409
+                "Campaign was cancelled",
+                code="campaign_cancelled",
+                status=409,
+                fields={"safeBoundary": True},
             )
         while controls["pause"].is_set():
             if controls["cancel"].wait(0.25):
                 raise TrainerError(
-                    "Campaign was cancelled", code="campaign_cancelled", status=409
+                    "Campaign was cancelled",
+                    code="campaign_cancelled",
+                    status=409,
+                    fields={"safeBoundary": True},
                 )
 
     def _controls(self, campaign_id: str) -> dict[str, threading.Event]:
@@ -1287,6 +1531,18 @@ class TrainerService:
         thread.start()
 
     def _recover_campaigns(self) -> None:
+        for reservation in self.store.incomplete_campaign_cancels():
+            if self._controller_lease.owner_is_active(reservation["controller_id"]):
+                continue
+            self.store.mark_campaign_cancel_reconciliation_required(
+                reservation["campaign_id"],
+                reservation["cancel_operation_id"],
+                controller_id=reservation["controller_id"],
+                reason=(
+                    "The controller that signalled cancellation is no longer active; "
+                    "Trainer cannot prove that all launched workloads are terminal"
+                ),
+            )
         reservations = self.store.incomplete_campaign_starts()
         reserved_campaigns = {item["campaign_id"] for item in reservations}
         for reservation in reservations:

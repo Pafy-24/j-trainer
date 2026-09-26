@@ -69,6 +69,15 @@ class StateStore:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS campaign_cancel_reservations (
+                    campaign_id TEXT PRIMARY KEY,
+                    cancel_operation_id TEXT NOT NULL UNIQUE,
+                    start_operation_id TEXT NOT NULL,
+                    controller_id TEXT NOT NULL,
+                    phase TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS idempotency (
                     scope TEXT NOT NULL,
                     idem_key TEXT NOT NULL,
@@ -242,6 +251,646 @@ class StateStore:
                 code="campaign_start_reservation_lost",
             )
 
+    def reserve_campaign_cancel(
+        self,
+        campaign_id: str,
+        start_operation_id: str,
+        operation: dict[str, Any],
+        *,
+        controller_id: str,
+    ) -> tuple[dict[str, Any], bool]:
+        """Persist an exact cancel intent before the in-process signal is set."""
+        cancel_operation_id = str(operation["operationId"])
+        now = utc_now()
+        with self._lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                campaign_row = self.connection.execute(
+                    "SELECT generation,payload FROM entities WHERE kind='campaign' AND entity_id=? AND archived=0",
+                    (campaign_id,),
+                ).fetchone()
+                if campaign_row is None:
+                    raise NotFoundError("campaign", campaign_id)
+                campaign = json.loads(campaign_row["payload"])
+
+                start_reservation = self.connection.execute(
+                    "SELECT operation_id,controller_id,phase FROM campaign_start_reservations WHERE campaign_id=?",
+                    (campaign_id,),
+                ).fetchone()
+                start_row = self.connection.execute(
+                    "SELECT payload FROM operations WHERE operation_id=?",
+                    (start_operation_id,),
+                ).fetchone()
+                existing = self.connection.execute(
+                    "SELECT cancel_operation_id,start_operation_id,controller_id,phase FROM campaign_cancel_reservations WHERE campaign_id=?",
+                    (campaign_id,),
+                ).fetchone()
+                if existing is not None:
+                    previous = self.connection.execute(
+                        "SELECT payload FROM operations WHERE operation_id=?",
+                        (existing["cancel_operation_id"],),
+                    ).fetchone()
+                    if (
+                        existing["cancel_operation_id"] == cancel_operation_id
+                        and existing["start_operation_id"] == start_operation_id
+                        and existing["phase"] == "terminal"
+                        and previous is not None
+                    ):
+                        self.connection.commit()
+                        return json.loads(previous["payload"]), False
+
+                if start_reservation is None or start_row is None or (
+                    start_reservation["operation_id"] != start_operation_id
+                    or start_reservation["controller_id"] != controller_id
+                ):
+                    raise ConflictError(
+                        "Campaign start is not actively owned by this controller",
+                        code="campaign_cancel_start_not_active",
+                    )
+                start = json.loads(start_row["payload"])
+                if start.get("action") != "campaign.start" or start.get("targetId") != campaign_id:
+                    raise ConflictError(
+                        "Cancel does not identify the campaign start operation",
+                        code="campaign_cancel_start_mismatch",
+                    )
+                if start.get("state") in {"succeeded", "failed", "cancelled"} or campaign.get("state") in {
+                    "succeeded", "failed", "cancelled"
+                }:
+                    raise ConflictError(
+                        "Campaign start is already terminal",
+                        code="campaign_cancel_too_late",
+                    )
+                if start_reservation["phase"] not in {"launch-committed", "running"}:
+                    raise ConflictError(
+                        "Campaign start is not actively owned by this controller",
+                        code="campaign_cancel_start_not_active",
+                    )
+
+                prior_operation = self.connection.execute(
+                    "SELECT payload FROM operations WHERE operation_id=?",
+                    (cancel_operation_id,),
+                ).fetchone()
+                if prior_operation is not None:
+                    prior = json.loads(prior_operation["payload"])
+                    if (
+                        prior.get("action") != "campaign.cancel"
+                        or prior.get("targetId") != campaign_id
+                        or (prior.get("result") or {}).get("startOperationId") != start_operation_id
+                    ):
+                        raise ConflictError(
+                            "Operation identifier belongs to another cancel intent",
+                            code="operation_identity_conflict",
+                        )
+                    self.connection.commit()
+                    return prior, False
+
+                if existing is not None:
+                    previous = self.connection.execute(
+                        "SELECT payload FROM operations WHERE operation_id=?",
+                        (existing["cancel_operation_id"],),
+                    ).fetchone()
+                    if (
+                        existing["cancel_operation_id"] == cancel_operation_id
+                        and existing["start_operation_id"] == start_operation_id
+                        and previous is not None
+                    ):
+                        self.connection.commit()
+                        return json.loads(previous["payload"]), False
+                    raise ConflictError(
+                        "Campaign already has a different cancel operation",
+                        code="campaign_cancel_reserved",
+                    )
+
+                stored_operation = dict(operation)
+                stored_operation["result"] = {"startOperationId": start_operation_id}
+                self.connection.execute(
+                    "INSERT INTO operations(operation_id,state,payload,created_at,updated_at) VALUES(?,?,?,?,?)",
+                    (
+                        cancel_operation_id,
+                        stored_operation["state"],
+                        canonical_json(stored_operation),
+                        stored_operation.get("createdAt", now),
+                        now,
+                    ),
+                )
+                self.connection.execute(
+                    """INSERT INTO campaign_cancel_reservations(
+                           campaign_id,cancel_operation_id,start_operation_id,controller_id,phase,created_at,updated_at
+                       ) VALUES(?,?,?,?, 'requested', ?, ?)""",
+                    (campaign_id, cancel_operation_id, start_operation_id, controller_id, now, now),
+                )
+                campaign.update(
+                    {
+                        "state": "cancelling",
+                        "generation": int(campaign_row["generation"]) + 1,
+                        "updatedAt": now,
+                    }
+                )
+                self.connection.execute(
+                    "UPDATE entities SET generation=?,payload=?,updated_at=? WHERE kind='campaign' AND entity_id=?",
+                    (campaign["generation"], canonical_json(campaign), now, campaign_id),
+                )
+                self.connection.commit()
+                return stored_operation, True
+            except BaseException:
+                self.connection.rollback()
+                raise
+
+    def mark_campaign_cancel_signal_committed(
+        self, campaign_id: str, cancel_operation_id: str, *, controller_id: str
+    ) -> dict[str, Any]:
+        now = utc_now()
+        with self._lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                reservation = self.connection.execute(
+                    """SELECT phase FROM campaign_cancel_reservations
+                       WHERE campaign_id=? AND cancel_operation_id=? AND controller_id=?""",
+                    (campaign_id, cancel_operation_id, controller_id),
+                ).fetchone()
+                row = self.connection.execute(
+                    "SELECT payload FROM operations WHERE operation_id=?",
+                    (cancel_operation_id,),
+                ).fetchone()
+                if reservation is None or row is None:
+                    raise ConflictError(
+                        "Campaign cancel reservation is no longer signalable",
+                        code="campaign_cancel_reservation_lost",
+                    )
+                operation = json.loads(row["payload"])
+                if reservation["phase"] == "terminal":
+                    start_id = (operation.get("result") or {}).get("startOperationId")
+                    start_row = self.connection.execute(
+                        "SELECT payload FROM operations WHERE operation_id=?",
+                        (start_id,),
+                    ).fetchone()
+                    campaign_row = self.connection.execute(
+                        "SELECT payload FROM entities WHERE kind='campaign' AND entity_id=?",
+                        (campaign_id,),
+                    ).fetchone()
+                    start = json.loads(start_row["payload"]) if start_row is not None else {}
+                    campaign = json.loads(campaign_row["payload"]) if campaign_row is not None else {}
+                    if (
+                        operation.get("state") == "succeeded"
+                        and operation.get("action") == "campaign.cancel"
+                        and operation.get("targetId") == campaign_id
+                        and start.get("state") == "cancelled"
+                        and campaign.get("state") == "cancelled"
+                    ):
+                        self.connection.commit()
+                        return operation
+                    raise ConflictError(
+                        "Campaign cancel terminal outcome is not cancelled",
+                        code="campaign_cancel_terminal_conflict",
+                    )
+                if reservation["phase"] == "signal-committed" and operation.get("state") == "running":
+                    self.connection.commit()
+                    return operation
+                if reservation["phase"] != "requested" or operation.get("state") != "queued":
+                    raise ConflictError(
+                        "Campaign cancel reservation is no longer signalable",
+                        code="campaign_cancel_reservation_lost",
+                    )
+                operation.update({"state": "running", "updatedAt": now})
+                self.connection.execute(
+                    "UPDATE operations SET state='running',payload=?,updated_at=? WHERE operation_id=? AND state='queued'",
+                    (canonical_json(operation), now, cancel_operation_id),
+                )
+                cursor = self.connection.execute(
+                    """UPDATE campaign_cancel_reservations
+                       SET phase='signal-committed',updated_at=?
+                       WHERE campaign_id=? AND cancel_operation_id=? AND controller_id=? AND phase='requested'""",
+                    (now, campaign_id, cancel_operation_id, controller_id),
+                )
+                if cursor.rowcount != 1:
+                    raise ConflictError(
+                        "Campaign cancel reservation is no longer signalable",
+                        code="campaign_cancel_reservation_lost",
+                    )
+                self.connection.commit()
+                return operation
+            except BaseException:
+                self.connection.rollback()
+                raise
+
+    def settle_campaign_cancelled(
+        self,
+        campaign_id: str,
+        start_operation_id: str,
+        *,
+        controller_id: str,
+    ) -> bool:
+        """Atomically publish cancellation after the owning worker has unwound."""
+        now = utc_now()
+        with self._lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                reservation = self.connection.execute(
+                    """SELECT cancel_operation_id,phase FROM campaign_cancel_reservations
+                       WHERE campaign_id=? AND start_operation_id=? AND controller_id=?""",
+                    (campaign_id, start_operation_id, controller_id),
+                ).fetchone()
+                if reservation is None or reservation["phase"] == "reconciliation-required":
+                    self.connection.commit()
+                    return False
+                if reservation["phase"] == "terminal":
+                    cancel_row = self.connection.execute(
+                        "SELECT payload FROM operations WHERE operation_id=?",
+                        (reservation["cancel_operation_id"],),
+                    ).fetchone()
+                    start_row = self.connection.execute(
+                        "SELECT payload FROM operations WHERE operation_id=?",
+                        (start_operation_id,),
+                    ).fetchone()
+                    campaign_row = self.connection.execute(
+                        "SELECT payload FROM entities WHERE kind='campaign' AND entity_id=?",
+                        (campaign_id,),
+                    ).fetchone()
+                    cancel = json.loads(cancel_row["payload"]) if cancel_row is not None else {}
+                    start = json.loads(start_row["payload"]) if start_row is not None else {}
+                    campaign = json.loads(campaign_row["payload"]) if campaign_row is not None else {}
+                    self.connection.commit()
+                    return bool(
+                        cancel.get("state") == "succeeded"
+                        and cancel.get("action") == "campaign.cancel"
+                        and cancel.get("targetId") == campaign_id
+                        and (cancel.get("result") or {}).get("startOperationId") == start_operation_id
+                        and start.get("state") == "cancelled"
+                        and campaign.get("state") == "cancelled"
+                    )
+                campaign_row = self.connection.execute(
+                    "SELECT generation,payload FROM entities WHERE kind='campaign' AND entity_id=?",
+                    (campaign_id,),
+                ).fetchone()
+                if campaign_row is None:
+                    raise NotFoundError("campaign", campaign_id)
+                campaign = json.loads(campaign_row["payload"])
+                if campaign.get("state") != "cancelling":
+                    self.connection.commit()
+                    return False
+
+                owned_job_ids = {
+                    str(row["entity_id"])
+                    for row in self.connection.execute(
+                        "SELECT entity_id,payload FROM entities WHERE kind='job' AND archived=0"
+                    ).fetchall()
+                    if json.loads(row["payload"]).get("campaignId") == campaign_id
+                }
+                for kind in ("job", "attempt"):
+                    rows = self.connection.execute(
+                        "SELECT entity_id,generation,payload FROM entities WHERE kind=? AND archived=0",
+                        (kind,),
+                    ).fetchall()
+                    for row in rows:
+                        payload = json.loads(row["payload"])
+                        belongs = (
+                            payload.get("campaignId") == campaign_id
+                            if kind == "job"
+                            else payload.get("jobId") in owned_job_ids
+                        )
+                        if not belongs or payload.get("state") not in {"queued", "preparing", "running"}:
+                            continue
+                        payload.update(
+                            {
+                                "state": "cancelled",
+                                "generation": int(row["generation"]) + 1,
+                                "updatedAt": now,
+                            }
+                        )
+                        if kind == "attempt":
+                            payload["completedAt"] = now
+                        self.connection.execute(
+                            "UPDATE entities SET generation=?,payload=?,updated_at=? WHERE kind=? AND entity_id=?",
+                            (payload["generation"], canonical_json(payload), now, kind, row["entity_id"]),
+                        )
+
+                campaign.update(
+                    {
+                        "state": "cancelled",
+                        "generation": int(campaign_row["generation"]) + 1,
+                        "updatedAt": now,
+                    }
+                )
+                self.connection.execute(
+                    "UPDATE entities SET generation=?,payload=?,updated_at=? WHERE kind='campaign' AND entity_id=?",
+                    (campaign["generation"], canonical_json(campaign), now, campaign_id),
+                )
+                for operation_id, state, result in (
+                    (start_operation_id, "cancelled", {"campaignId": campaign_id}),
+                    (
+                        reservation["cancel_operation_id"],
+                        "succeeded",
+                        {"campaignId": campaign_id, "startOperationId": start_operation_id},
+                    ),
+                ):
+                    row = self.connection.execute(
+                        "SELECT payload FROM operations WHERE operation_id=?", (operation_id,)
+                    ).fetchone()
+                    if row is None:
+                        raise ConflictError("Cancellation operation receipt is missing", code="campaign_cancel_receipt_missing")
+                    payload = json.loads(row["payload"])
+                    payload.update({"state": state, "result": result, "updatedAt": now})
+                    self.connection.execute(
+                        "UPDATE operations SET state=?,payload=?,updated_at=? WHERE operation_id=?",
+                        (state, canonical_json(payload), now, operation_id),
+                    )
+                self.connection.execute(
+                    "UPDATE campaign_start_reservations SET phase='terminal',updated_at=? WHERE campaign_id=? AND operation_id=?",
+                    (now, campaign_id, start_operation_id),
+                )
+                self.connection.execute(
+                    "UPDATE campaign_cancel_reservations SET phase='terminal',updated_at=? WHERE campaign_id=?",
+                    (now, campaign_id),
+                )
+                self.connection.commit()
+                return True
+            except BaseException:
+                self.connection.rollback()
+                raise
+
+    def campaign_cancel_reservation(self, campaign_id: str) -> dict[str, str] | None:
+        with self._lock:
+            row = self.connection.execute(
+                "SELECT * FROM campaign_cancel_reservations WHERE campaign_id=?",
+                (campaign_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def active_campaign_start(self, campaign_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self.connection.execute(
+                """SELECT r.operation_id,r.controller_id,r.phase,o.payload
+                   FROM campaign_start_reservations r JOIN operations o
+                   ON o.operation_id=r.operation_id WHERE r.campaign_id=?""",
+                (campaign_id,),
+            ).fetchone()
+        if row is None or row["phase"] not in {
+            "launch-committed",
+            "running",
+            "reconciliation-required",
+        }:
+            return None
+        return {
+            "operationId": row["operation_id"],
+            "controllerId": row["controller_id"],
+            "phase": row["phase"],
+            "operation": json.loads(row["payload"]),
+        }
+
+    def cancel_unstarted_campaign(self, campaign_id: str) -> dict[str, Any]:
+        """Preserve the legacy admin cancel for work that was never launched."""
+        now = utc_now()
+        with self._lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                start = self.connection.execute(
+                    "SELECT phase FROM campaign_start_reservations WHERE campaign_id=?",
+                    (campaign_id,),
+                ).fetchone()
+                if start is not None and start["phase"] != "terminal":
+                    raise ConflictError(
+                        "Active campaign cancellation requires exact operation identifiers",
+                        code="cancel_operation_ids_required",
+                    )
+                row = self.connection.execute(
+                    "SELECT generation,payload FROM entities WHERE kind='campaign' AND entity_id=? AND archived=0",
+                    (campaign_id,),
+                ).fetchone()
+                if row is None:
+                    raise NotFoundError("campaign", campaign_id)
+                campaign = json.loads(row["payload"])
+                if campaign.get("state") in {"succeeded", "failed", "cancelled"}:
+                    self.connection.commit()
+                    return campaign
+                campaign.update(
+                    {
+                        "state": "cancelled",
+                        "generation": int(row["generation"]) + 1,
+                        "updatedAt": now,
+                    }
+                )
+                self.connection.execute(
+                    "UPDATE entities SET generation=?,payload=?,updated_at=? WHERE kind='campaign' AND entity_id=?",
+                    (campaign["generation"], canonical_json(campaign), now, campaign_id),
+                )
+                self.connection.commit()
+                return campaign
+            except BaseException:
+                self.connection.rollback()
+                raise
+
+    def settle_campaign_succeeded(
+        self,
+        campaign_id: str,
+        start_operation_id: str,
+        result: dict[str, Any],
+        *,
+        controller_id: str,
+    ) -> bool:
+        """Commit natural success only if a cancel intent did not win first."""
+        now = utc_now()
+        with self._lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                cancel = self.connection.execute(
+                    "SELECT phase FROM campaign_cancel_reservations WHERE campaign_id=?",
+                    (campaign_id,),
+                ).fetchone()
+                if cancel is not None and cancel["phase"] != "terminal":
+                    self.connection.commit()
+                    return False
+                campaign_row = self.connection.execute(
+                    "SELECT generation,payload FROM entities WHERE kind='campaign' AND entity_id=?",
+                    (campaign_id,),
+                ).fetchone()
+                operation_row = self.connection.execute(
+                    "SELECT payload FROM operations WHERE operation_id=?",
+                    (start_operation_id,),
+                ).fetchone()
+                if campaign_row is None or operation_row is None:
+                    raise ConflictError("Campaign execution receipt is missing", code="campaign_start_receipt_missing")
+                campaign = json.loads(campaign_row["payload"])
+                operation = json.loads(operation_row["payload"])
+                if campaign.get("state") in {"succeeded", "failed", "cancelled"}:
+                    self.connection.commit()
+                    return campaign.get("state") == "succeeded"
+                campaign.update({"state": "succeeded", "generation": int(campaign_row["generation"]) + 1, "updatedAt": now})
+                operation.update({"state": "succeeded", "result": result, "updatedAt": now})
+                self.connection.execute(
+                    "UPDATE entities SET generation=?,payload=?,updated_at=? WHERE kind='campaign' AND entity_id=?",
+                    (campaign["generation"], canonical_json(campaign), now, campaign_id),
+                )
+                self.connection.execute(
+                    "UPDATE operations SET state='succeeded',payload=?,updated_at=? WHERE operation_id=?",
+                    (canonical_json(operation), now, start_operation_id),
+                )
+                cursor = self.connection.execute(
+                    "UPDATE campaign_start_reservations SET phase='terminal',updated_at=? WHERE campaign_id=? AND operation_id=? AND controller_id=? AND phase!='reconciliation-required'",
+                    (now, campaign_id, start_operation_id, controller_id),
+                )
+                if cursor.rowcount != 1:
+                    raise ConflictError("Campaign start reservation is no longer owned", code="campaign_start_reservation_lost")
+                self.connection.commit()
+                return True
+            except BaseException:
+                self.connection.rollback()
+                raise
+
+    def settle_campaign_failed(
+        self,
+        campaign_id: str,
+        start_operation_id: str,
+        error: dict[str, Any],
+        *,
+        controller_id: str,
+    ) -> bool:
+        """Publish the real execution failure and close any losing cancel intent."""
+        now = utc_now()
+        with self._lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                start_reservation = self.connection.execute(
+                    "SELECT phase FROM campaign_start_reservations WHERE campaign_id=? AND operation_id=? AND controller_id=?",
+                    (campaign_id, start_operation_id, controller_id),
+                ).fetchone()
+                cancel_fence = self.connection.execute(
+                    "SELECT phase FROM campaign_cancel_reservations WHERE campaign_id=?",
+                    (campaign_id,),
+                ).fetchone()
+                if start_reservation is not None and start_reservation["phase"] == "terminal":
+                    self.connection.commit()
+                    return False
+                if (
+                    start_reservation is None
+                    or start_reservation["phase"] == "reconciliation-required"
+                    or (cancel_fence is not None and cancel_fence["phase"] == "reconciliation-required")
+                ):
+                    self.connection.commit()
+                    return False
+                campaign_row = self.connection.execute(
+                    "SELECT generation,payload FROM entities WHERE kind='campaign' AND entity_id=?",
+                    (campaign_id,),
+                ).fetchone()
+                start_row = self.connection.execute(
+                    "SELECT payload FROM operations WHERE operation_id=?",
+                    (start_operation_id,),
+                ).fetchone()
+                if campaign_row is None or start_row is None:
+                    raise ConflictError("Campaign execution receipt is missing", code="campaign_start_receipt_missing")
+                campaign = json.loads(campaign_row["payload"])
+                start = json.loads(start_row["payload"])
+                if campaign.get("state") in {"succeeded", "failed", "cancelled"} or start.get("state") in {
+                    "succeeded", "failed", "cancelled"
+                }:
+                    self.connection.commit()
+                    return False
+                campaign.update({"state": "failed", "generation": int(campaign_row["generation"]) + 1, "updatedAt": now})
+                start.update({"state": "failed", "error": error, "updatedAt": now})
+                self.connection.execute(
+                    "UPDATE entities SET generation=?,payload=?,updated_at=? WHERE kind='campaign' AND entity_id=?",
+                    (campaign["generation"], canonical_json(campaign), now, campaign_id),
+                )
+                self.connection.execute(
+                    "UPDATE operations SET state='failed',payload=?,updated_at=? WHERE operation_id=?",
+                    (canonical_json(start), now, start_operation_id),
+                )
+                cancel = self.connection.execute(
+                    "SELECT cancel_operation_id,phase FROM campaign_cancel_reservations WHERE campaign_id=?",
+                    (campaign_id,),
+                ).fetchone()
+                if cancel is not None and cancel["phase"] != "terminal":
+                    row = self.connection.execute(
+                        "SELECT payload FROM operations WHERE operation_id=?",
+                        (cancel["cancel_operation_id"],),
+                    ).fetchone()
+                    if row is not None:
+                        operation = json.loads(row["payload"])
+                        operation.update(
+                            {
+                                "state": "failed",
+                                "updatedAt": now,
+                                "error": {
+                                    "code": "campaign_failed_before_cancellation",
+                                    "detail": error.get("detail", "Campaign failed"),
+                                },
+                            }
+                        )
+                        self.connection.execute(
+                            "UPDATE operations SET state='failed',payload=?,updated_at=? WHERE operation_id=?",
+                            (canonical_json(operation), now, cancel["cancel_operation_id"]),
+                        )
+                    self.connection.execute(
+                        "UPDATE campaign_cancel_reservations SET phase='terminal',updated_at=? WHERE campaign_id=?",
+                        (now, campaign_id),
+                    )
+                self.connection.execute(
+                    "UPDATE campaign_start_reservations SET phase='terminal',updated_at=? WHERE campaign_id=? AND operation_id=? AND controller_id=?",
+                    (now, campaign_id, start_operation_id, controller_id),
+                )
+                self.connection.commit()
+                return True
+            except BaseException:
+                self.connection.rollback()
+                raise
+
+    def incomplete_campaign_cancels(self) -> list[dict[str, str]]:
+        with self._lock:
+            rows = self.connection.execute(
+                "SELECT * FROM campaign_cancel_reservations WHERE phase IN ('requested','signal-committed') ORDER BY created_at,campaign_id"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def mark_campaign_cancel_reconciliation_required(
+        self,
+        campaign_id: str,
+        cancel_operation_id: str,
+        *,
+        controller_id: str,
+        reason: str,
+        details: dict[str, Any] | None = None,
+    ) -> bool:
+        now = utc_now()
+        with self._lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                reservation = self.connection.execute(
+                    "SELECT phase FROM campaign_cancel_reservations WHERE campaign_id=? AND cancel_operation_id=? AND controller_id=?",
+                    (campaign_id, cancel_operation_id, controller_id),
+                ).fetchone()
+                if reservation is None or reservation["phase"] not in {"requested", "signal-committed"}:
+                    self.connection.commit()
+                    return False
+                row = self.connection.execute(
+                    "SELECT payload FROM operations WHERE operation_id=?", (cancel_operation_id,)
+                ).fetchone()
+                if row is None:
+                    raise ConflictError("Cancellation operation receipt is missing", code="campaign_cancel_receipt_missing")
+                operation = json.loads(row["payload"])
+                operation.update(
+                    {
+                        "state": "reconciliation-required",
+                        "updatedAt": now,
+                        "error": {
+                            "code": "campaign_cancel_outcome_unknown",
+                            "detail": reason,
+                            **(details or {}),
+                        },
+                    }
+                )
+                self.connection.execute(
+                    "UPDATE operations SET state=?,payload=?,updated_at=? WHERE operation_id=?",
+                    (operation["state"], canonical_json(operation), now, cancel_operation_id),
+                )
+                self.connection.execute(
+                    "UPDATE campaign_cancel_reservations SET phase='reconciliation-required',updated_at=? WHERE campaign_id=?",
+                    (now, campaign_id),
+                )
+                self.connection.commit()
+                return True
+            except BaseException:
+                self.connection.rollback()
+                raise
+
     def require_campaign_plan_access(
         self,
         campaign_id: str,
@@ -289,6 +938,78 @@ class StateStore:
                     "Campaign start reservation is no longer launchable",
                     code="campaign_start_reservation_lost",
                 )
+
+    def mark_campaign_start_running(
+        self, campaign_id: str, operation_id: str, *, controller_id: str
+    ) -> bool:
+        """Publish running only when no atomic cancel reservation won first."""
+        now = utc_now()
+        with self._lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                reservation = self.connection.execute(
+                    """SELECT phase FROM campaign_start_reservations
+                       WHERE campaign_id=? AND operation_id=? AND controller_id=?""",
+                    (campaign_id, operation_id, controller_id),
+                ).fetchone()
+                campaign_row = self.connection.execute(
+                    "SELECT generation,payload FROM entities WHERE kind='campaign' AND entity_id=?",
+                    (campaign_id,),
+                ).fetchone()
+                operation_row = self.connection.execute(
+                    "SELECT payload FROM operations WHERE operation_id=?",
+                    (operation_id,),
+                ).fetchone()
+                if reservation is None or campaign_row is None or operation_row is None:
+                    raise ConflictError(
+                        "Campaign start reservation is no longer owned",
+                        code="campaign_start_reservation_lost",
+                    )
+                if reservation["phase"] == "running":
+                    self.connection.commit()
+                    return True
+                if reservation["phase"] != "launch-committed":
+                    self.connection.commit()
+                    return False
+                campaign = json.loads(campaign_row["payload"])
+                operation = json.loads(operation_row["payload"])
+                if campaign.get("state") == "cancelling":
+                    self.connection.commit()
+                    return False
+                if campaign.get("state") in {"succeeded", "failed", "cancelled"}:
+                    self.connection.commit()
+                    return False
+                campaign.update(
+                    {
+                        "state": "running",
+                        "generation": int(campaign_row["generation"]) + 1,
+                        "updatedAt": now,
+                    }
+                )
+                operation.update({"state": "running", "updatedAt": now})
+                self.connection.execute(
+                    "UPDATE entities SET generation=?,payload=?,updated_at=? WHERE kind='campaign' AND entity_id=?",
+                    (campaign["generation"], canonical_json(campaign), now, campaign_id),
+                )
+                self.connection.execute(
+                    "UPDATE operations SET state='running',payload=?,updated_at=? WHERE operation_id=?",
+                    (canonical_json(operation), now, operation_id),
+                )
+                cursor = self.connection.execute(
+                    """UPDATE campaign_start_reservations SET phase='running',updated_at=?
+                       WHERE campaign_id=? AND operation_id=? AND controller_id=? AND phase='launch-committed'""",
+                    (now, campaign_id, operation_id, controller_id),
+                )
+                if cursor.rowcount != 1:
+                    raise ConflictError(
+                        "Campaign start reservation changed concurrently",
+                        code="campaign_start_reservation_lost",
+                    )
+                self.connection.commit()
+                return True
+            except BaseException:
+                self.connection.rollback()
+                raise
 
     def commit_campaign_plan(
         self,
@@ -435,6 +1156,7 @@ class StateStore:
         *,
         controller_id: str,
         reason: str,
+        details: dict[str, Any] | None = None,
     ) -> bool:
         now = utc_now()
         with self._lock:
@@ -447,6 +1169,13 @@ class StateStore:
                     """,
                     (campaign_id, operation_id, controller_id),
                 ).fetchone()
+                cancel_reservation = self.connection.execute(
+                    """
+                    SELECT cancel_operation_id, start_operation_id, controller_id, phase
+                    FROM campaign_cancel_reservations WHERE campaign_id=?
+                    """,
+                    (campaign_id,),
+                ).fetchone()
                 if reservation is None or reservation["phase"] not in {
                     "reserved",
                     "launch-committed",
@@ -454,6 +1183,14 @@ class StateStore:
                 }:
                     self.connection.commit()
                     return False
+                if cancel_reservation is not None and (
+                    cancel_reservation["start_operation_id"] != operation_id
+                    or cancel_reservation["controller_id"] != controller_id
+                ):
+                    raise ConflictError(
+                        "Campaign cancellation identity differs from its active start",
+                        code="campaign_cancel_identity_mismatch",
+                    )
                 row = self.connection.execute(
                     "SELECT payload FROM operations WHERE operation_id=?",
                     (operation_id,),
@@ -471,6 +1208,7 @@ class StateStore:
                         "error": {
                             "code": "campaign_start_outcome_unknown",
                             "detail": reason,
+                            **(details or {}),
                         },
                     }
                 )
@@ -491,6 +1229,51 @@ class StateStore:
                     """,
                     (now, campaign_id),
                 )
+                if (
+                    cancel_reservation is not None
+                    and cancel_reservation["phase"] in {"requested", "signal-committed"}
+                ):
+                    cancel_operation_id = str(
+                        cancel_reservation["cancel_operation_id"]
+                    )
+                    cancel_row = self.connection.execute(
+                        "SELECT payload FROM operations WHERE operation_id=?",
+                        (cancel_operation_id,),
+                    ).fetchone()
+                    if cancel_row is None:
+                        raise ConflictError(
+                            "Cancellation operation receipt is missing",
+                            code="campaign_cancel_receipt_missing",
+                        )
+                    cancel_operation = json.loads(cancel_row["payload"])
+                    cancel_operation.update(
+                        {
+                            "state": "reconciliation-required",
+                            "updatedAt": now,
+                            "error": {
+                                "code": "campaign_cancel_outcome_unknown",
+                                "detail": reason,
+                                **(details or {}),
+                            },
+                        }
+                    )
+                    self.connection.execute(
+                        "UPDATE operations SET state=?,payload=?,updated_at=? WHERE operation_id=?",
+                        (
+                            cancel_operation["state"],
+                            canonical_json(cancel_operation),
+                            now,
+                            cancel_operation_id,
+                        ),
+                    )
+                    self.connection.execute(
+                        """
+                        UPDATE campaign_cancel_reservations
+                        SET phase='reconciliation-required',updated_at=?
+                        WHERE campaign_id=? AND cancel_operation_id=?
+                        """,
+                        (now, campaign_id, cancel_operation_id),
+                    )
                 campaign_row = self.connection.execute(
                     "SELECT generation, payload FROM entities WHERE kind='campaign' AND entity_id=?",
                     (campaign_id,),
