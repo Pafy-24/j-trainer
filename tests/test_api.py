@@ -73,8 +73,10 @@ def test_managed_api_fails_closed_without_a_session_and_never_uses_bearer(tmp_pa
         assert client.post("/v1/campaigns", headers={"X-Jester-Component-Session": "opaque-session-token-at-least-24-chars"}, json={}).status_code == 422
 
 
-def test_managed_campaign_owner_rejects_cross_owner_replays_and_survives_restart(tmp_path: Path) -> None:
-    from tests.helpers import campaign, dataset_manifest
+def test_managed_campaign_owner_rejects_cross_owner_replays_and_survives_restart(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    from tests.helpers import campaign
     data = tmp_path / "data.jsonl"
     data.write_text('{"id":"x","text":"x"}\n', encoding="utf-8")
     topology = {
@@ -86,8 +88,13 @@ def test_managed_campaign_owner_rejects_cross_owner_replays_and_survives_restart
         "nodes": [],
     }
     settings = Settings.for_test(tmp_path / "trainer", topology=topology)
+    digest = hashlib.sha256(data.read_bytes()).hexdigest()
+    artifacts = tmp_path / "artifacts.json"
+    artifacts.write_text(json.dumps({"entries": [{
+        "digest": f"sha256:{digest}", "kind": "file", "checkoutPath": str(data),
+    }]}), encoding="utf-8")
+    monkeypatch.setenv("JESTER_RM_ARTIFACT_MANIFEST", str(artifacts))
     service = TrainerService(settings)
-    service.put_dataset(dataset_manifest(data))
 
     def local(operation: str, method: str) -> dict[str, object]:
         return {
@@ -144,10 +151,21 @@ def test_managed_campaign_owner_rejects_cross_owner_replays_and_survives_restart
     with TestClient(
         create_app(service, managed_channel_guard=guard, require_managed_session=True)
     ) as client:
+        registered = client.post("/v1/datasets", headers=owner_a_headers, json={
+            "metadata": {"id": "tiny-dataset"},
+            "files": [{
+                "split": "train", "digest": f"sha256:{digest}",
+                "artifactDigest": f"sha256:{digest}", "logicalPath": "data.jsonl",
+            }],
+        })
+        assert registered.status_code == 201
         created = client.post("/v1/campaigns", headers=owner_a_headers, json=owner_a_campaign)
         assert created.status_code == 201
         assert created.json()["metadata"]["id"] == "campaign-one"
-        assert introspection_calls == [("trainer.campaign:create", "POST")]
+        assert introspection_calls == [
+            ("trainer.dataset:register", "POST"),
+            ("trainer.campaign:create", "POST"),
+        ]
 
         def queued_start(
             campaign_id: str, *, operation_id: str | None = None
@@ -205,17 +223,17 @@ def test_managed_campaign_owner_rejects_cross_owner_replays_and_survives_restart
             headers={**owner_b_headers, "Idempotency-Key": "new"},
             json=owner_a_campaign,
         )
-        assert same_key.status_code == 409
-        assert same_key.json()["code"] == "campaign_owner_conflict"
-        assert new_key.status_code == 409
-        assert new_key.json()["code"] == "campaign_owner_conflict"
+        assert same_key.status_code == 403
+        assert same_key.json()["code"] == "channel_session_denied"
+        assert new_key.status_code == 403
+        assert new_key.json()["code"] == "channel_session_denied"
 
         # A global idempotency key must not return owner A's result to owner B.
         different_campaign = client.post(
             "/v1/campaigns", headers=owner_b_headers, json=owner_b_campaign
         )
-        assert different_campaign.status_code == 409
-        assert different_campaign.json()["code"] == "idempotency_conflict"
+        assert different_campaign.status_code == 403
+        assert different_campaign.json()["code"] == "channel_session_denied"
 
     service.close()
     reopened = TrainerService(settings)
@@ -315,7 +333,7 @@ def test_managed_create_cannot_claim_existing_unowned_legacy_campaign(tmp_path: 
             headers={"X-Jester-Component-Session": "owner-a", "Idempotency-Key": "claim"},
             json=legacy.api_dict(),
         )
-        assert denied.status_code == 409
-        assert denied.json()["code"] == "campaign_owner_missing"
+        assert denied.status_code == 403
+        assert denied.json()["code"] == "channel_session_denied"
         assert service.store.campaign_owner("legacy-campaign") is None
         assert service.get_campaign("legacy-campaign").api_dict() == original

@@ -12,7 +12,7 @@ from fastapi import Body, Depends, FastAPI, Header, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from .errors import AuthenticationError, TrainerError
+from .errors import AuthenticationError, ConflictError, TrainerError
 from .channel_sessions import ChannelSessionDenied, ManagedChannelGuard
 from .models import Campaign, DatasetManifest
 from .service import TrainerService
@@ -48,7 +48,15 @@ def create_app(
         if require_managed_session and request.url.path != "/v1/health":
             operation = None
             campaign_id = None
-            if request.method == "POST" and request.url.path == "/v1/campaigns":
+            dataset_id = None
+            if request.method == "POST" and request.url.path == "/v1/datasets":
+                operation = "trainer.dataset:register"
+            elif request.method == "GET" and (
+                match := re.fullmatch(r"/v1/datasets/([^/]+)", request.url.path)
+            ):
+                operation = "trainer.dataset:read"
+                dataset_id = match.group(1)
+            elif request.method == "POST" and request.url.path == "/v1/campaigns":
                 operation = "trainer.campaign:create"
             elif request.method == "POST" and (
                 match := re.fullmatch(
@@ -80,7 +88,8 @@ def create_app(
                 if operation is None:
                     raise ChannelSessionDenied("managed channel operation is not allowed")
                 authorize_managed_channel(
-                    request, operation=operation, campaign_id=campaign_id
+                    request, operation=operation, campaign_id=campaign_id,
+                    dataset_id=dataset_id,
                 )
             except (ChannelSessionDenied, TrainerError):
                 return JSONResponse(status_code=401, content={
@@ -134,10 +143,13 @@ def create_app(
 
     secured = [Depends(auth)]
 
-    def authorize_managed_channel(request: Request, *, operation: str, campaign_id: str | None = None) -> Any:
+    def authorize_managed_channel(
+        request: Request, *, operation: str, campaign_id: str | None = None,
+        dataset_id: str | None = None,
+    ) -> Any:
         if not require_managed_session:
             return
-        binding = (operation, request.method, campaign_id)
+        binding = (operation, request.method, campaign_id, dataset_id)
         cached = getattr(request.state, "managed_channel_claims", None)
         if cached is not None:
             if getattr(request.state, "managed_channel_binding", None) != binding:
@@ -153,6 +165,19 @@ def create_app(
             claims = managed_channel_guard.authorize(request.headers, operation=operation, method=request.method)
             if campaign_id is not None and trainer.store.campaign_owner(campaign_id) != (claims.project_id, claims.deployment_id):
                 raise TrainerError("managed channel session is not authorized", code="channel_session_denied", status=403)
+            if dataset_id is not None:
+                try:
+                    trainer.store.managed_dataset(
+                        dataset_id,
+                        project_id=claims.project_id,
+                        deployment_id=claims.deployment_id,
+                    )
+                except ConflictError as exc:
+                    raise TrainerError(
+                        "managed channel session is not authorized",
+                        code="channel_session_denied",
+                        status=403,
+                    ) from exc
             request.state.managed_channel_claims = claims
             request.state.managed_channel_binding = binding
             return claims
@@ -186,8 +211,21 @@ def create_app(
     @app.post("/v1/datasets", status_code=201, dependencies=secured)
     def create_dataset(
         manifest: DatasetManifest,
+        request: Request,
         idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     ) -> dict[str, Any]:
+        claims = authorize_managed_channel(request, operation="trainer.dataset:register")
+        if require_managed_session:
+            return trainer.idempotent(
+                f"datasets.create:{claims.project_id}:{claims.deployment_id}",
+                idempotency_key,
+                _idempotency_payload(manifest),
+                lambda: trainer.register_managed_dataset(
+                    manifest,
+                    project_id=claims.project_id,
+                    deployment_id=claims.deployment_id,
+                ),
+            )
         return trainer.idempotent(
             "datasets.create",
             idempotency_key,
@@ -196,7 +234,16 @@ def create_app(
         )
 
     @app.get("/v1/datasets/{dataset_id}", dependencies=secured)
-    def dataset(dataset_id: str) -> dict[str, Any]:
+    def dataset(dataset_id: str, request: Request) -> dict[str, Any]:
+        claims = authorize_managed_channel(
+            request, operation="trainer.dataset:read", dataset_id=dataset_id
+        )
+        if require_managed_session:
+            return trainer.get_managed_dataset(
+                dataset_id,
+                project_id=claims.project_id,
+                deployment_id=claims.deployment_id,
+            )
         return trainer.get_dataset(dataset_id).api_dict()
 
     @app.post("/v1/datasets/{dataset_id}/validate", dependencies=secured)
@@ -235,13 +282,21 @@ def create_app(
         idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     ) -> dict[str, Any]:
         claims = authorize_managed_channel(request, operation="trainer.campaign:create")
-        if require_managed_session:
-            trainer.store.bind_campaign_owner(campaign.metadata.id, project_id=claims.project_id, deployment_id=claims.deployment_id)
         result = trainer.idempotent(
-            "campaigns.create",
+            (
+                f"campaigns.create:{claims.project_id}:{claims.deployment_id}"
+                if require_managed_session else "campaigns.create"
+            ),
             idempotency_key,
             _idempotency_payload(campaign),
-            lambda: trainer.put_campaign(campaign),
+            lambda: (
+                trainer.put_managed_campaign(
+                    campaign,
+                    project_id=claims.project_id,
+                    deployment_id=claims.deployment_id,
+                )
+                if require_managed_session else trainer.put_campaign(campaign)
+            ),
         )
         return result
 

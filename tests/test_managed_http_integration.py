@@ -54,7 +54,7 @@ def test_rm_issued_session_controls_actual_trainer_campaign_handlers(tmp_path, m
             controller.store.put_entity("instance", item.metadata.id, item.api_dict(), expected_generation=0)
         deployment = Deployment.model_validate({"metadata":{"id":"deployment-one"}, "spec":{
             "projectId":"project-one", "engineInstanceId":"engine-one", "members":[{"memberId":"trainer","instanceId":"trainer-one"}],
-            "controllerChannels":[{"channelId":"engine-trainer","destinationMemberId":"trainer","destinationPort":"http","purpose":"inference","allowedOperations":["trainer.campaign:create", "trainer.campaign:status"]}],
+            "controllerChannels":[{"channelId":"engine-trainer","destinationMemberId":"trainer","destinationPort":"http","purpose":"training","allowedOperations":["trainer.dataset:register", "trainer.dataset:read", "trainer.campaign:create", "trainer.campaign:status"]}],
         }})
         stored = controller.put_deployment(deployment)
         running = Deployment.model_validate(stored).model_copy(update={"state":"running"})
@@ -68,12 +68,25 @@ def test_rm_issued_session_controls_actual_trainer_campaign_handlers(tmp_path, m
         guard = ManagedChannelGuard(ManagedChannelContext(rm_url="http://unused"), introspect=lambda credential, expected: controller.introspect_controller_channel_session(credential, expectation=expected) or {}, expectation_provider=local)
         from jester_trainer.config import Settings as TrainerSettings
         from jester_trainer.service import TrainerService
-        from tests.helpers import dataset_manifest
         data = tmp_path / "train.jsonl"; data.write_text('{"id":"one","text":"x"}\n', encoding="utf-8")
+        import hashlib
+        digest = hashlib.sha256(data.read_bytes()).hexdigest()
+        artifact_manifest = tmp_path / "trainer-artifacts.json"
+        artifact_manifest.write_text(json.dumps({"entries": [{
+            "digest": f"sha256:{digest}", "kind": "file", "checkoutPath": str(data),
+        }]}), encoding="utf-8")
+        monkeypatch.setenv("JESTER_RM_ARTIFACT_MANIFEST", str(artifact_manifest))
         service = TrainerService(TrainerSettings.for_test(tmp_path / "trainer", topology={"topologyId":"test-training-topology","topologyType":"training","role":"trainer","nodeId":"trainer","channels":[],"nodes":[]}))
-        service.put_dataset(dataset_manifest(data))
         body = campaign(tmp_path, tmp_path / "model", campaign_id="campaign-one", version="v1", workers=[]).api_dict()
         with TestClient(create_app(service, managed_channel_guard=guard, require_managed_session=True)) as client:
+            registered = _post(client, "/v1/datasets", first["credential"], {
+                "metadata": {"id": "tiny-dataset"},
+                "files": [{
+                    "split": "train", "digest": f"sha256:{digest}",
+                    "artifactDigest": f"sha256:{digest}", "logicalPath": "train.jsonl",
+                }],
+            })
+            assert registered.status_code == 201
             created = _post(client, "/v1/campaigns", first["credential"], body)
             assert created.status_code == 201
             assert client.get("/v1/campaigns/campaign-one", headers={"X-Jester-Component-Session":first["credential"]}).status_code == 200

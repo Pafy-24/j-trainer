@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import threading
@@ -8,6 +9,18 @@ from typing import Any
 
 from .errors import ConflictError, NotFoundError
 from .util import canonical_json, utc_now
+
+
+def _managed_manifest_sha256(payload: dict[str, Any]) -> str:
+    stable = {
+        key: payload[key]
+        for key in (
+            "apiVersion", "kind", "metadata", "files",
+            "semanticCaseIdField", "seed",
+        )
+        if key in payload
+    }
+    return hashlib.sha256(canonical_json(stable).encode("utf-8")).hexdigest()
 
 
 class StateStore:
@@ -60,6 +73,20 @@ class StateStore:
                     project_id TEXT NOT NULL,
                     deployment_id TEXT NOT NULL,
                     created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS dataset_owners (
+                    dataset_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    deployment_id TEXT NOT NULL,
+                    manifest_sha256 TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS campaign_dataset_bindings (
+                    campaign_id TEXT NOT NULL,
+                    dataset_id TEXT NOT NULL,
+                    manifest_sha256 TEXT NOT NULL,
+                    PRIMARY KEY(campaign_id, dataset_id),
+                    FOREIGN KEY(campaign_id) REFERENCES campaign_owners(campaign_id)
                 );
                 CREATE TABLE IF NOT EXISTS campaign_start_reservations (
                     campaign_id TEXT PRIMARY KEY,
@@ -126,6 +153,244 @@ class StateStore:
         with self._lock:
             row=self.connection.execute("SELECT project_id, deployment_id FROM campaign_owners WHERE campaign_id=?", (campaign_id,)).fetchone()
         return (str(row["project_id"]), str(row["deployment_id"])) if row else None
+
+    def dataset_owner(self, dataset_id: str) -> tuple[str, str, str] | None:
+        with self._lock:
+            row = self.connection.execute(
+                "SELECT project_id,deployment_id,manifest_sha256 FROM dataset_owners WHERE dataset_id=?",
+                (dataset_id,),
+            ).fetchone()
+        return (
+            (str(row["project_id"]), str(row["deployment_id"]), str(row["manifest_sha256"]))
+            if row else None
+        )
+
+    def managed_dataset(
+        self, dataset_id: str, *, project_id: str, deployment_id: str
+    ) -> tuple[dict[str, Any], str] | None:
+        """Atomically distinguish absent, foreign/unmanaged and exact owned data."""
+        with self._lock:
+            owner = self.connection.execute(
+                "SELECT project_id,deployment_id,manifest_sha256 FROM dataset_owners WHERE dataset_id=?",
+                (dataset_id,),
+            ).fetchone()
+            entity = self.connection.execute(
+                "SELECT payload FROM entities WHERE kind='dataset' AND entity_id=? AND archived=0",
+                (dataset_id,),
+            ).fetchone()
+            if owner is None and entity is None:
+                return None
+            if owner is None or entity is None or (
+                owner["project_id"], owner["deployment_id"]
+            ) != (project_id, deployment_id):
+                raise ConflictError(
+                    "dataset is not owned by this managed deployment",
+                    code="dataset_owner_conflict",
+                )
+            payload = json.loads(entity["payload"])
+            digest = str(owner["manifest_sha256"])
+            if _managed_manifest_sha256(payload) != digest:
+                raise ConflictError(
+                    "stored dataset manifest differs from its immutable owner binding",
+                    code="dataset_manifest_binding_changed",
+                )
+            return payload, digest
+
+    def register_managed_dataset(
+        self,
+        dataset_id: str,
+        payload: dict[str, Any],
+        *,
+        project_id: str,
+        deployment_id: str,
+        manifest_sha256: str,
+    ) -> dict[str, Any]:
+        """Atomically bind an immutable dataset manifest to one managed owner."""
+        if _managed_manifest_sha256(payload) != manifest_sha256:
+            raise ConflictError(
+                "managed dataset manifest digest does not match its approved payload",
+                code="dataset_manifest_digest_mismatch",
+            )
+        now = utc_now()
+        with self._lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                owner = self.connection.execute(
+                    "SELECT project_id,deployment_id,manifest_sha256 FROM dataset_owners WHERE dataset_id=?",
+                    (dataset_id,),
+                ).fetchone()
+                entity = self.connection.execute(
+                    "SELECT payload FROM entities WHERE kind='dataset' AND entity_id=? AND archived=0",
+                    (dataset_id,),
+                ).fetchone()
+                if owner is not None:
+                    if (owner["project_id"], owner["deployment_id"]) != (project_id, deployment_id):
+                        raise ConflictError(
+                            "dataset is owned by another managed deployment",
+                            code="dataset_owner_conflict",
+                        )
+                    if owner["manifest_sha256"] != manifest_sha256:
+                        raise ConflictError(
+                            "dataset identifier is bound to a different immutable manifest",
+                            code="dataset_manifest_conflict",
+                        )
+                    if entity is None:
+                        raise ConflictError(
+                            "managed dataset owner has no stored manifest",
+                            code="dataset_manifest_missing",
+                        )
+                    if _managed_manifest_sha256(json.loads(entity["payload"])) != manifest_sha256:
+                        raise ConflictError(
+                            "stored dataset manifest differs from its immutable owner binding",
+                            code="dataset_manifest_binding_changed",
+                        )
+                    self.connection.commit()
+                    return json.loads(entity["payload"])
+                if entity is not None:
+                    raise ConflictError(
+                        "existing unmanaged dataset cannot be claimed by a managed deployment",
+                        code="dataset_owner_missing",
+                    )
+                stored = dict(payload)
+                stored.update({"generation": 1, "createdAt": now, "updatedAt": now})
+                self.connection.execute(
+                    "INSERT INTO dataset_owners(dataset_id,project_id,deployment_id,manifest_sha256,created_at) VALUES(?,?,?,?,?)",
+                    (dataset_id, project_id, deployment_id, manifest_sha256, now),
+                )
+                self.connection.execute(
+                    """INSERT INTO entities(kind,entity_id,generation,payload,archived,created_at,updated_at)
+                       VALUES('dataset',?,?,?,0,?,?)""",
+                    (dataset_id, 1, canonical_json(stored), now, now),
+                )
+                self.connection.commit()
+                return stored
+            except BaseException:
+                self.connection.rollback()
+                raise
+
+    def put_managed_campaign(
+        self,
+        campaign_id: str,
+        payload: dict[str, Any],
+        *,
+        project_id: str,
+        deployment_id: str,
+        dataset_ids: list[str],
+    ) -> dict[str, Any]:
+        """Atomically create campaign ownership, frozen dataset bindings and entity."""
+        now = utc_now()
+        unique_ids = sorted(set(dataset_ids))
+        with self._lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                campaign_owner = self.connection.execute(
+                    "SELECT project_id,deployment_id FROM campaign_owners WHERE campaign_id=?",
+                    (campaign_id,),
+                ).fetchone()
+                campaign_entity = self.connection.execute(
+                    "SELECT payload FROM entities WHERE kind='campaign' AND entity_id=? AND archived=0",
+                    (campaign_id,),
+                ).fetchone()
+                if campaign_owner is not None or campaign_entity is not None:
+                    if campaign_owner is None:
+                        raise ConflictError(
+                            "existing unmanaged campaign cannot be claimed by a managed deployment",
+                            code="campaign_owner_missing",
+                        )
+                    if (campaign_owner["project_id"], campaign_owner["deployment_id"]) != (project_id, deployment_id):
+                        raise ConflictError(
+                            "campaign is owned by another deployment",
+                            code="campaign_owner_conflict",
+                        )
+                    raise ConflictError(
+                        "managed campaign already exists",
+                        code="campaign_already_exists",
+                    )
+                bindings: list[tuple[str, str]] = []
+                for dataset_id in unique_ids:
+                    owner = self.connection.execute(
+                        "SELECT project_id,deployment_id,manifest_sha256 FROM dataset_owners WHERE dataset_id=?",
+                        (dataset_id,),
+                    ).fetchone()
+                    if owner is None or (owner["project_id"], owner["deployment_id"]) != (project_id, deployment_id):
+                        raise ConflictError(
+                            f"dataset {dataset_id} is not owned by this managed deployment",
+                            code="campaign_dataset_owner_conflict",
+                        )
+                    entity = self.connection.execute(
+                        "SELECT payload FROM entities WHERE kind='dataset' AND entity_id=? AND archived=0",
+                        (dataset_id,),
+                    ).fetchone()
+                    if entity is None or _managed_manifest_sha256(json.loads(entity["payload"])) != owner["manifest_sha256"]:
+                        raise ConflictError(
+                            f"managed dataset manifest changed for {dataset_id}",
+                            code="campaign_dataset_binding_changed",
+                        )
+                    bindings.append((dataset_id, str(owner["manifest_sha256"])))
+                self.connection.execute(
+                    "INSERT INTO campaign_owners(campaign_id,project_id,deployment_id,created_at) VALUES(?,?,?,?)",
+                    (campaign_id, project_id, deployment_id, now),
+                )
+                self.connection.executemany(
+                    "INSERT INTO campaign_dataset_bindings(campaign_id,dataset_id,manifest_sha256) VALUES(?,?,?)",
+                    [(campaign_id, dataset_id, digest) for dataset_id, digest in bindings],
+                )
+                stored = dict(payload)
+                stored.update({"generation": 1, "createdAt": now, "updatedAt": now})
+                self.connection.execute(
+                    """INSERT INTO entities(kind,entity_id,generation,payload,archived,created_at,updated_at)
+                       VALUES('campaign',?,?,?,0,?,?)""",
+                    (campaign_id, 1, canonical_json(stored), now, now),
+                )
+                self.connection.commit()
+                return stored
+            except BaseException:
+                self.connection.rollback()
+                raise
+
+    def require_managed_campaign_datasets(
+        self, campaign_id: str, *, dataset_ids: list[str]
+    ) -> tuple[str, str] | None:
+        """Verify current immutable owner/digests against the frozen campaign snapshot."""
+        with self._lock:
+            owner = self.connection.execute(
+                "SELECT project_id,deployment_id FROM campaign_owners WHERE campaign_id=?",
+                (campaign_id,),
+            ).fetchone()
+            if owner is None:
+                return None
+            rows = self.connection.execute(
+                "SELECT dataset_id,manifest_sha256 FROM campaign_dataset_bindings WHERE campaign_id=?",
+                (campaign_id,),
+            ).fetchall()
+            expected = {str(row["dataset_id"]): str(row["manifest_sha256"]) for row in rows}
+            if set(expected) != set(dataset_ids):
+                raise ConflictError(
+                    "managed campaign has no exact frozen dataset binding",
+                    code="campaign_dataset_binding_missing",
+                )
+            for dataset_id, digest in expected.items():
+                current = self.connection.execute(
+                    "SELECT project_id,deployment_id,manifest_sha256 FROM dataset_owners WHERE dataset_id=?",
+                    (dataset_id,),
+                ).fetchone()
+                if current is None or (
+                    current["project_id"], current["deployment_id"], current["manifest_sha256"]
+                ) != (owner["project_id"], owner["deployment_id"], digest):
+                    raise ConflictError(
+                        f"managed dataset binding changed for {dataset_id}",
+                        code="campaign_dataset_binding_changed",
+                    )
+                entity = self.connection.execute(
+                    "SELECT payload FROM entities WHERE kind='dataset' AND entity_id=? AND archived=0",
+                    (dataset_id,),
+                ).fetchone()
+                if entity is None or _managed_manifest_sha256(json.loads(entity["payload"])) != digest:
+                    raise ConflictError(
+                        f"managed dataset manifest changed for {dataset_id}",
+                        code="campaign_dataset_binding_changed",
+                    )
+        return str(owner["project_id"]), str(owner["deployment_id"])
 
     def reserve_campaign_start(
         self,

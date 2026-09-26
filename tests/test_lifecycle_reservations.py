@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import multiprocessing
 import os
+import hashlib
+import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -16,7 +18,9 @@ from jester_trainer.api import create_app
 from jester_trainer.channel_sessions import ManagedChannelContext, ManagedChannelGuard
 from jester_trainer.config import Settings
 from jester_trainer.errors import ConflictError, TrainerError
-from jester_trainer.models import CampaignState, Operation, TrainingAttempt, TrainingJob
+from jester_trainer.models import (
+    CampaignState, DatasetManifest, Operation, TrainingAttempt, TrainingJob,
+)
 from jester_trainer.parameter_server import ParameterServer
 from jester_trainer.service import TrainerService
 from jester_trainer.workers import WorkerDescriptor
@@ -58,6 +62,47 @@ def _planned_campaign(service: TrainerService, root: Path, campaign_id: str) -> 
         campaign_id,
         planned.api_dict(),
         expected_generation=current.generation,
+    )
+
+
+def _managed_artifact(root: Path, monkeypatch: pytest.MonkeyPatch) -> str:
+    data = root / "managed.jsonl"
+    data.parent.mkdir(parents=True, exist_ok=True)
+    data.write_text('{"id":"one","text":"hello"}\n', encoding="utf-8")
+    digest = hashlib.sha256(data.read_bytes()).hexdigest()
+    artifact_manifest = root / "rm-artifacts.json"
+    artifact_manifest.write_text(json.dumps({"entries": [{
+        "digest": f"sha256:{digest}", "kind": "file", "checkoutPath": str(data),
+    }]}), encoding="utf-8")
+    monkeypatch.setenv("JESTER_RM_ARTIFACT_MANIFEST", str(artifact_manifest))
+    return digest
+
+
+def _planned_managed_campaign(
+    service: TrainerService, root: Path, campaign_id: str, digest: str
+) -> None:
+    service.register_managed_dataset(
+        DatasetManifest.model_validate({
+            "metadata": {"id": "tiny-dataset"},
+            "files": [{
+                "split": "train", "digest": f"sha256:{digest}",
+                "artifactDigest": f"sha256:{digest}", "logicalPath": "managed.jsonl",
+            }],
+        }),
+        project_id="project-a",
+        deployment_id="deployment-a",
+    )
+    service.put_managed_campaign(
+        campaign(
+            root, root / "model", campaign_id=campaign_id, version="v1", workers=[]
+        ),
+        project_id="project-a",
+        deployment_id="deployment-a",
+    )
+    current = service.get_campaign(campaign_id)
+    planned = current.model_copy(update={"state": CampaignState.PLANNED})
+    service.store.put_entity(
+        "campaign", campaign_id, planned.api_dict(), expected_generation=current.generation
     )
 
 
@@ -264,14 +309,12 @@ def test_reopen_fences_ambiguous_cancel_without_resignal_or_terminal_overwrite(
 
 
 def test_managed_cancel_requires_exact_ids_and_returns_operation_receipt(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root = tmp_path / "trainer"
+    digest = _managed_artifact(root, monkeypatch)
     service = TrainerService(_settings(root))
-    service.store.bind_campaign_owner(
-        "campaign-api-cancel", project_id="project-a", deployment_id="deployment-a"
-    )
-    _planned_campaign(service, root, "campaign-api-cancel")
+    _planned_managed_campaign(service, root, "campaign-api-cancel", digest)
     service._spawn = lambda _name, _action: None  # type: ignore[method-assign]
     start_operation_id = "engine.trainer." + "a" * 32
     cancel_operation_id = "engine.trainer.cancel." + "b" * 32
@@ -1353,15 +1396,13 @@ def test_sqlite_reservation_coordinates_independent_processes(
 
 
 def test_managed_same_key_replay_is_stable_across_service_connections(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root = tmp_path / "trainer"
+    digest = _managed_artifact(root, monkeypatch)
     first = TrainerService(_settings(root))
     second = TrainerService(_settings(root))
-    first.store.bind_campaign_owner(
-        "campaign-managed", project_id="project-a", deployment_id="deployment-a"
-    )
-    _planned_campaign(first, root, "campaign-managed")
+    _planned_managed_campaign(first, root, "campaign-managed", digest)
     spawns: list[str] = []
     first._spawn = lambda _name, _action: spawns.append("first")  # type: ignore[method-assign]
     second._spawn = lambda _name, _action: spawns.append("second")  # type: ignore[method-assign]

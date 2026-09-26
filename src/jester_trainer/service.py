@@ -204,6 +204,61 @@ class TrainerService:
             self.store.get_entity("dataset", dataset_id)
         )
 
+    @staticmethod
+    def managed_manifest_identity(
+        manifest: DatasetManifest | dict[str, Any],
+    ) -> tuple[dict[str, Any], str]:
+        """Hash only approved fields, excluding server generation/timestamps."""
+        value = manifest.api_dict() if isinstance(manifest, DatasetManifest) else dict(manifest)
+        stable = {
+            key: value[key]
+            for key in (
+                "apiVersion", "kind", "metadata", "files",
+                "semanticCaseIdField", "seed",
+            )
+            if key in value
+        }
+        return stable, sha256_json(stable)
+
+    def register_managed_dataset(
+        self, manifest: DatasetManifest, *, project_id: str, deployment_id: str
+    ) -> dict[str, Any]:
+        for item in manifest.files:
+            if item.path is not None or item.artifact_digest is None or not item.logical_path:
+                raise TrainerError(
+                    "Managed datasets require artifactDigest and logicalPath and forbid local path",
+                    code="managed_dataset_artifact_binding_required",
+                    status=422,
+                )
+        self.datasets.validate(manifest)
+        _stable, digest = self.managed_manifest_identity(manifest)
+        stored = self.store.register_managed_dataset(
+            manifest.metadata.id,
+            manifest.api_dict(),
+            project_id=project_id,
+            deployment_id=deployment_id,
+            manifest_sha256=digest,
+        )
+        return {"manifest": stored, "manifestSha256": f"sha256:{digest}"}
+
+    def get_managed_dataset(
+        self, dataset_id: str, *, project_id: str, deployment_id: str
+    ) -> dict[str, Any]:
+        try:
+            owned = self.store.managed_dataset(
+                dataset_id, project_id=project_id, deployment_id=deployment_id
+            )
+        except ConflictError as exc:
+            raise TrainerError(
+                "managed channel session is not authorized",
+                code="channel_session_denied",
+                status=403,
+            ) from exc
+        if owned is None:
+            raise NotFoundError("dataset", dataset_id)
+        manifest, observed = owned
+        return {"manifest": manifest, "manifestSha256": f"sha256:{observed}"}
+
     def put_dataset(
         self, manifest: DatasetManifest, *, expected_generation: int | None = None
     ) -> dict[str, Any]:
@@ -246,6 +301,33 @@ class TrainerService:
     def put_campaign(
         self, campaign: Campaign, *, expected_generation: int | None = None
     ) -> dict[str, Any]:
+        campaign = self._prepare_campaign(campaign)
+        return self._put_new_or_expected(
+            "campaign",
+            campaign.metadata.id,
+            campaign.api_dict(),
+            expected_generation,
+        )
+
+    def put_managed_campaign(
+        self, campaign: Campaign, *, project_id: str, deployment_id: str
+    ) -> dict[str, Any]:
+        campaign = self._prepare_campaign(campaign)
+        dataset_ids = self._campaign_dataset_ids(campaign)
+        for dataset_id in dataset_ids:
+            self.get_managed_dataset(
+                dataset_id, project_id=project_id, deployment_id=deployment_id
+            )
+            self.datasets.validate(self.get_dataset(dataset_id))
+        return self.store.put_managed_campaign(
+            campaign.metadata.id,
+            campaign.api_dict(),
+            project_id=project_id,
+            deployment_id=deployment_id,
+            dataset_ids=dataset_ids,
+        )
+
+    def _prepare_campaign(self, campaign: Campaign) -> Campaign:
         if campaign.spec.topology_id != self.settings.topology.get("topologyId"):
             raise ConflictError(
                 "Campaign topologyId differs from the Trainer RM lease",
@@ -267,12 +349,24 @@ class TrainerService:
             self._relative_to_instance_root(
                 Path(campaign.spec.checkpoint.output_directory)
             )
-        return self._put_new_or_expected(
-            "campaign",
+        return campaign
+
+    @staticmethod
+    def _campaign_dataset_ids(campaign: Campaign) -> list[str]:
+        uses = list(campaign.spec.datasets)
+        uses.extend(use for facet in campaign.spec.facets for use in facet.datasets)
+        return sorted({item.dataset_id for item in uses})
+
+    def _validate_frozen_campaign_datasets(self, campaign: Campaign) -> None:
+        owner = self.store.require_managed_campaign_datasets(
             campaign.metadata.id,
-            campaign.api_dict(),
-            expected_generation,
+            dataset_ids=self._campaign_dataset_ids(campaign),
         )
+        if owner is None:
+            return
+        for dataset_id in self._campaign_dataset_ids(campaign):
+            self.get_managed_dataset(dataset_id, project_id=owner[0], deployment_id=owner[1])
+            self.datasets.validate(self.get_dataset(dataset_id))
 
     def patch_campaign(
         self, campaign_id: str, patch: dict[str, Any], expected_generation: int
@@ -326,6 +420,7 @@ class TrainerService:
             controller_id=self._controller_lease.instance_id,
         )
         campaign = self.get_campaign(campaign_id)
+        self._validate_frozen_campaign_datasets(campaign)
         dataset_uses = list(campaign.spec.datasets)
         dataset_uses.extend(
             use for facet in campaign.spec.facets for use in facet.datasets
@@ -392,6 +487,7 @@ class TrainerService:
     def _start_campaign(
         self, campaign_id: str, *, operation_id: str | None = None
     ) -> dict[str, Any]:
+        self._validate_frozen_campaign_datasets(self.get_campaign(campaign_id))
         operation = Operation(
             operationId=operation_id or uuid.uuid4().hex,
             action="campaign.start",
