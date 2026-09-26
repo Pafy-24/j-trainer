@@ -292,6 +292,18 @@ class TrainingJob(APIModel):
     updated_at: str = Field(default_factory=utc_now, alias="updatedAt")
 
 
+class ExecutionLineage(APIModel):
+    schema_version: Literal["jester-trainer-execution-lineage-v1"] = Field(
+        default="jester-trainer-execution-lineage-v1", alias="schemaVersion"
+    )
+    project_id: str = Field(alias="projectId")
+    deployment_id: str = Field(alias="deploymentId")
+    campaign_id: str = Field(alias="campaignId")
+    start_operation_id: str = Field(alias="startOperationId")
+    job_id: str = Field(alias="jobId")
+    attempt_id: str = Field(alias="attemptId")
+
+
 class TrainingAttempt(APIModel):
     api_version: Literal[API_VERSION] = Field(default=API_VERSION, alias="apiVersion")
     kind: Literal["TrainingAttempt"] = "TrainingAttempt"
@@ -299,6 +311,7 @@ class TrainingAttempt(APIModel):
     job_id: str = Field(alias="jobId")
     number: int = Field(ge=1)
     cohort: list[str]
+    lineage: ExecutionLineage | None = None
     state: Literal[
         "running", "succeeded", "failed", "cancelled", "reconciliation-required"
     ] = "running"
@@ -323,6 +336,7 @@ class TrainingRound(APIModel):
     kind: Literal["TrainingRound"] = "TrainingRound"
     round_id: str = Field(alias="roundId")
     attempt_id: str = Field(alias="attemptId")
+    lineage: ExecutionLineage | None = None
     index: int = Field(ge=0)
     state: RoundState = RoundState.PREPARING
     weight_version: str = Field(alias="weightVersion")
@@ -343,12 +357,31 @@ class TrainingResult(APIModel):
     result_id: str = Field(alias="resultId")
     campaign_id: str = Field(alias="campaignId")
     job_id: str = Field(alias="jobId")
+    lineage: ExecutionLineage | None = None
     facet_reference: str = Field(alias="facetReference")
     artifact_path: str = Field(alias="artifactPath")
     artifact_sha256: str = Field(alias="artifactSha256")
     artifact_digest: str | None = Field(default=None, alias="artifactDigest")
     metrics: dict[str, Any] = Field(default_factory=dict)
     promoted: bool = False
+    generation: int = Field(default=1, ge=1)
+    created_at: str = Field(default_factory=utc_now, alias="createdAt")
+    updated_at: str = Field(default_factory=utc_now, alias="updatedAt")
+
+
+class ArtifactPublication(APIModel):
+    schema_version: Literal["jester-trainer-artifact-publication-v1"] = Field(
+        default="jester-trainer-artifact-publication-v1", alias="schemaVersion"
+    )
+    kind: Literal["ArtifactPublication"] = "ArtifactPublication"
+    publication_id: str = Field(alias="publicationId")
+    result_id: str = Field(alias="resultId")
+    lineage: ExecutionLineage
+    state: Literal["dispatched", "acknowledged"] = "dispatched"
+    artifact_digest: str | None = Field(default=None, alias="artifactDigest")
+    artifact_sha256: str = Field(alias="artifactSha256")
+    descriptor_kind: str | None = Field(default=None, alias="descriptorKind")
+    descriptor_size: int | None = Field(default=None, alias="descriptorSize", ge=0)
     generation: int = Field(default=1, ge=1)
     created_at: str = Field(default_factory=utc_now, alias="createdAt")
     updated_at: str = Field(default_factory=utc_now, alias="updatedAt")

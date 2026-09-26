@@ -404,10 +404,15 @@ def create_app(
         request: Request,
         operation_id: str | None = Query(default=None, alias="operationId"),
     ) -> dict[str, Any]:
-        authorize_managed_channel(
+        claims = authorize_managed_channel(
             request, operation="trainer.campaign:execution", campaign_id=campaign_id
         )
-        return trainer.campaign_execution(campaign_id, operation_id=operation_id)
+        return trainer.campaign_execution(
+            campaign_id,
+            operation_id=operation_id,
+            expected_project_id=getattr(claims, "project_id", None),
+            expected_deployment_id=getattr(claims, "deployment_id", None),
+        )
 
     @app.post("/v1/campaigns/{campaign_id}/actions/pause", status_code=202, dependencies=secured)
     def pause_campaign(

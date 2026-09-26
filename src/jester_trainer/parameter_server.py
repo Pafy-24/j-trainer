@@ -114,6 +114,7 @@ class ParameterServer:
             round_model = TrainingRound(
                 roundId=round_id,
                 attemptId=self.attempt.attempt_id,
+                lineage=self.attempt.lineage,
                 index=round_index,
                 state=RoundState.PREPARING,
                 weightVersion=self.current_version,
@@ -280,10 +281,28 @@ class ParameterServer:
                     code="worker_session_identity_mismatch",
                     status=502,
                 )
+            for key in ("weightVersion", "weightSha256"):
+                if not isinstance(summary.get(key), str) or not summary[key]:
+                    raise TrainerError(
+                        f"Worker {worker_id} returned an invalid {key} acknowledgement",
+                        code="worker_session_create_invalid_ack",
+                        status=502,
+                    )
+            if "state" in summary and not isinstance(summary["state"], str):
+                raise TrainerError(
+                    f"Worker {worker_id} returned an invalid state acknowledgement",
+                    code="worker_session_create_invalid_ack",
+                    status=502,
+                )
             self.session_summaries[worker_id] = summary
             self._record_session_observation(
                 worker_id,
                 create_state="acknowledged",
+                create_ack={
+                    key: summary[key]
+                    for key in ("id", "state", "weightVersion", "weightSha256")
+                    if key in summary
+                },
             )
         tensor_sets = {
             sha256_json(summary["engine"]["tensorSpecs"])
@@ -323,6 +342,10 @@ class ParameterServer:
                 worker_id,
                 cleanup_state="acknowledged",
                 cleanup_error=None,
+                cleanup_ack={
+                    key: response[key]
+                    for key in ("id", "deleted", "artifactsRetained")
+                } if response is not None else None,
             )
         return self._record_session_observation(
             worker_id,
@@ -340,6 +363,8 @@ class ParameterServer:
         create_state: str | None = None,
         cleanup_state: str | None = None,
         cleanup_error: dict[str, Any] | None = None,
+        create_ack: dict[str, Any] | None = None,
+        cleanup_ack: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         session_id = self.session_ids[worker_id]
         previous = self.session_observations.get(worker_id)
@@ -351,6 +376,10 @@ class ParameterServer:
                 "campaignId": self.campaign.metadata.id,
                 "jobId": self.job.job_id,
                 "attemptId": self.attempt.attempt_id,
+                "lineage": (
+                    None if self.attempt.lineage is None
+                    else self.attempt.lineage.api_dict()
+                ),
                 "workerId": worker_id,
                 "sessionId": session_id,
                 "createState": create_state or "dispatched",
@@ -368,6 +397,10 @@ class ParameterServer:
             payload.pop("cleanupError", None)
         else:
             payload["cleanupError"] = cleanup_error
+        if create_ack is not None:
+            payload["createAck"] = create_ack
+        if cleanup_ack is not None:
+            payload["cleanupAck"] = cleanup_ack
         stored = self.persist(
             "worker-session", session_id, payload, expected_generation
         )

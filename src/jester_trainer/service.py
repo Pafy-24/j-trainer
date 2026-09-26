@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import inspect
 import json
 import os
 import shutil
@@ -19,10 +21,12 @@ from .db import StateStore
 from .errors import ConflictError, NotFoundError, TrainerError
 from .lifecycle import ControllerLease
 from .models import (
+    ArtifactPublication,
     Campaign,
     CampaignState,
     DatasetManifest,
     Event,
+    ExecutionLineage,
     Operation,
     OperationState,
     TrainingAttempt,
@@ -692,35 +696,481 @@ class TrainerService:
         return self.store.get_operation(operation_id)
 
     def campaign_execution(
-        self, campaign_id: str, *, operation_id: str | None = None
+        self, campaign_id: str, *, operation_id: str | None = None,
+        expected_project_id: str | None = None,
+        expected_deployment_id: str | None = None,
     ) -> dict[str, Any]:
-        campaign = self.get_campaign(campaign_id)
-        operations = [
-            item for item in self.store.list_operations()
-            if item.get("action") == "campaign.start"
-            and item.get("targetId") == campaign_id
-            and (operation_id is None or item.get("operationId") == operation_id)
-        ]
-        latest = operations[-1] if operations else None
-        cancellation = None
-        reservation = self.store.campaign_cancel_reservation(campaign_id)
-        if reservation is not None and (
-            operation_id is None or reservation["start_operation_id"] == operation_id
+        snapshot = self.store.execution_snapshot(
+            campaign_id, start_operation_id=operation_id
+        )
+        owner = snapshot["owner"]
+        if owner is None and expected_project_id is None:
+            cancellation = snapshot["cancellation"]
+            if cancellation is not None:
+                cancellation = {
+                    **cancellation,
+                    "operation": snapshot["selectedCancelOperation"],
+                }
+            return {
+                "schemaVersion": "jester-trainer-campaign-execution-v1",
+                "campaign": snapshot["campaign"],
+                "operation": snapshot["selectedOperation"],
+                "cancellation": cancellation,
+                "jobs": snapshot["entities"]["job"],
+            }
+        if expected_project_id is not None and (
+            owner is None
+            or owner.get("projectId") != expected_project_id
+            or owner.get("deploymentId") != expected_deployment_id
         ):
+            raise TrainerError(
+                "managed campaign execution belongs to another owner",
+                code="channel_session_denied",
+                status=403,
+            )
+        operation = snapshot["selectedOperation"]
+        selected_operation_id = (
+            str(operation.get("operationId")) if operation is not None else operation_id
+        )
+        cancellation = snapshot["cancellation"]
+        if cancellation is not None:
             cancellation = {
-                "phase": reservation["phase"],
-                "startOperationId": reservation["start_operation_id"],
-                "cancelOperationId": reservation["cancel_operation_id"],
-                "operation": self.store.get_operation(
-                    reservation["cancel_operation_id"]
+                **cancellation,
+                "operation": self._execution_operation_projection(
+                    snapshot["selectedCancelOperation"]
                 ),
             }
+        campaign = snapshot["campaign"]
+        jobs = [
+            self._execution_job_projection(item)
+            for item in snapshot["entities"]["job"]
+            if item.get("campaignId") == campaign_id
+        ]
+        audit = self._execution_audit(
+            snapshot,
+            campaign_id=campaign_id,
+            start_operation_id=selected_operation_id,
+        )
         return {
+            # Preserve the outer resource version consumed by existing
+            # lifecycle clients while explicitly versioning the new bounded
+            # managed projection and its nested audit contract.
             "schemaVersion": "jester-trainer-campaign-execution-v1",
-            "campaign": campaign.api_dict(),
-            "operation": latest,
+            "projectionSchemaVersion": "jester-trainer-managed-execution-projection-v2",
+            "campaign": {
+                "metadata": {"id": campaign_id},
+                "state": campaign.get("state"),
+                "generation": campaign.get("generation"),
+            },
+            "owner": owner,
+            "operation": self._execution_operation_projection(operation),
             "cancellation": cancellation,
-            "jobs": self.campaign_jobs(campaign_id),
+            "jobs": jobs,
+            "audit": audit,
+        }
+
+    @staticmethod
+    def _execution_operation_projection(
+        operation: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if operation is None:
+            return None
+        projected = {
+            key: operation[key]
+            for key in (
+                "operationId", "action", "targetId", "state", "createdAt", "updatedAt"
+            )
+            if key in operation
+        }
+        error = operation.get("error")
+        if isinstance(error, dict):
+            bounded_error: dict[str, Any] = {}
+            if isinstance(error.get("code"), str):
+                bounded_error["code"] = error["code"]
+            if isinstance(error.get("causeCode"), str):
+                bounded_error["causeCode"] = error["causeCode"]
+            job_errors = error.get("jobErrors")
+            if isinstance(job_errors, list):
+                bounded_error["jobErrors"] = [
+                    {
+                        key: item[key]
+                        for key in ("jobId", "code")
+                        if isinstance(item, dict) and isinstance(item.get(key), str)
+                    }
+                    for item in job_errors[:2000]
+                    if isinstance(item, dict)
+                ]
+            if bounded_error:
+                projected["error"] = bounded_error
+        return projected
+
+    @staticmethod
+    def _execution_job_projection(job: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: job[key]
+            for key in (
+                "jobId", "campaignId", "facetId", "candidateId", "state", "workerIds",
+                "attempt", "resultId", "generation",
+            )
+            if key in job
+        }
+
+    @staticmethod
+    def _lineage_matches(
+        lineage: Any, *, owner: dict[str, Any], campaign_id: str,
+        start_operation_id: str, job_id: str | None = None,
+        attempt_id: str | None = None,
+    ) -> bool:
+        if not isinstance(lineage, dict):
+            return False
+        expected = {
+            "schemaVersion": "jester-trainer-execution-lineage-v1",
+            "projectId": owner.get("projectId"),
+            "deploymentId": owner.get("deploymentId"),
+            "campaignId": campaign_id,
+            "startOperationId": start_operation_id,
+        }
+        if any(lineage.get(key) != value for key, value in expected.items()):
+            return False
+        if job_id is not None and lineage.get("jobId") != job_id:
+            return False
+        if attempt_id is not None and lineage.get("attemptId") != attempt_id:
+            return False
+        return isinstance(lineage.get("jobId"), str) and isinstance(
+            lineage.get("attemptId"), str
+        )
+
+    def _execution_audit(
+        self, snapshot: dict[str, Any], *, campaign_id: str,
+        start_operation_id: str | None,
+    ) -> dict[str, Any]:
+        owner = snapshot["owner"]
+        reasons: list[str] = []
+        unavailable: list[dict[str, str]] = []
+        for kind in snapshot.get("truncated", []):
+            reasons.append(f"evidence-truncated:{kind}")
+        if owner is None:
+            reasons.append("campaign-owner-unavailable")
+        if start_operation_id is None:
+            reasons.append("start-operation-unavailable")
+        entities = snapshot["entities"]
+        jobs = {
+            str(item["jobId"]): item
+            for item in entities["job"]
+            if item.get("campaignId") == campaign_id and isinstance(item.get("jobId"), str)
+        }
+        exact: dict[str, list[dict[str, Any]]] = {
+            kind: [] for kind in ("attempt", "round", "result", "publication", "worker-session")
+        }
+        if owner is not None and start_operation_id is not None:
+            for kind in exact:
+                for item in entities[kind]:
+                    item_id = self._execution_entity_id(kind, item)
+                    lineage = item.get("lineage")
+                    job_id = (
+                        lineage.get("jobId") if isinstance(lineage, dict)
+                        else self._historical_entity_job_id(kind, item, entities)
+                    )
+                    if job_id not in jobs:
+                        continue
+                    if lineage is None:
+                        unavailable.append({"kind": kind, "id": item_id})
+                        continue
+                    if self._lineage_matches(
+                        lineage, owner=owner, campaign_id=campaign_id,
+                        start_operation_id=start_operation_id,
+                        job_id=str(job_id), attempt_id=str(lineage.get("attemptId", "")),
+                    ):
+                        exact[kind].append(item)
+                    elif lineage.get("campaignId") == campaign_id and lineage.get(
+                        "startOperationId"
+                    ) == start_operation_id:
+                        reasons.append(f"{kind}-lineage-mismatch")
+
+        attempts = [self._attempt_audit_projection(item) for item in exact["attempt"]]
+        attempt_by_id = {item["attemptId"]: item for item in attempts}
+        rounds = [
+            self._round_audit_projection(item) for item in exact["round"]
+            if item.get("attemptId") in attempt_by_id
+        ]
+        sessions = [
+            self._session_audit_projection(item) for item in exact["worker-session"]
+            if item.get("attemptId") in attempt_by_id
+        ]
+        results = [self._result_audit_projection(item) for item in exact["result"]]
+        publications = [
+            self._publication_audit_projection(item) for item in exact["publication"]
+        ]
+        for item in rounds:
+            parent = attempt_by_id.get(item.get("attemptId"))
+            if parent is None or item.get("lineage", {}).get("jobId") != parent.get("jobId"):
+                reasons.append("round-attempt-lineage-mismatch")
+        for item in sessions:
+            parent = attempt_by_id.get(item.get("attemptId"))
+            if (
+                parent is None
+                or item.get("jobId") != parent.get("jobId")
+                or item.get("lineage", {}).get("jobId") != parent.get("jobId")
+            ):
+                reasons.append("worker-session-attempt-lineage-mismatch")
+        result_by_id = {item.get("resultId"): item for item in results}
+        for item in results:
+            lineage = item.get("lineage", {})
+            parent = attempt_by_id.get(lineage.get("attemptId"))
+            if (
+                parent is None
+                or item.get("jobId") != parent.get("jobId")
+                or lineage.get("jobId") != parent.get("jobId")
+            ):
+                reasons.append("result-attempt-lineage-mismatch")
+        for item in publications:
+            lineage = item.get("lineage", {})
+            parent = attempt_by_id.get(lineage.get("attemptId"))
+            result = result_by_id.get(item.get("resultId"))
+            if (
+                parent is None
+                or lineage.get("jobId") != parent.get("jobId")
+                or (
+                    result is not None
+                    and (
+                        result.get("lineage", {}).get("attemptId")
+                        != lineage.get("attemptId")
+                        or result.get("jobId") != parent.get("jobId")
+                    )
+                )
+            ):
+                reasons.append("publication-result-lineage-mismatch")
+        if any(item.get("state") == "dispatched" for item in publications):
+            reasons.append("artifact-publication-outcome-unknown")
+        result_ids = {item.get("resultId") for item in results}
+        if any(
+            item.get("state") == "acknowledged"
+            and item.get("resultId") not in result_ids
+            for item in publications
+        ):
+            reasons.append("artifact-publication-result-pending")
+        for attempt in attempts:
+            attempt_id = attempt["attemptId"]
+            cohort = attempt.get("cohort", [])
+            if attempt.get("state") not in {"succeeded", "failed", "cancelled"}:
+                reasons.append("attempt-not-terminal")
+            if (
+                not isinstance(cohort, list)
+                or not cohort
+                or any(not isinstance(item, str) or not item for item in cohort)
+                or len(set(cohort)) != len(cohort)
+            ):
+                reasons.append("attempt-cohort-invalid")
+                continue
+            observed_sessions = [
+                item for item in sessions if item.get("attemptId") == attempt_id
+            ]
+            if sorted(item.get("workerId") for item in observed_sessions) != sorted(cohort):
+                reasons.append("worker-session-cohort-mismatch")
+            for item in observed_sessions:
+                create_ack = item.get("createAck")
+                if not isinstance(create_ack, dict) or create_ack.get("id") != item.get("sessionId"):
+                    reasons.append("worker-session-create-ack-missing")
+                cleanup_ack = item.get("cleanupAck")
+                if item.get("cleanupState") == "outcome-unknown":
+                    reasons.append("worker-session-cleanup-outcome-unknown")
+                elif not (
+                    item.get("cleanupState") == "acknowledged"
+                    and isinstance(cleanup_ack, dict)
+                    and cleanup_ack.get("id") == item.get("sessionId")
+                    and cleanup_ack.get("deleted") is True
+                    and cleanup_ack.get("artifactsRetained") is True
+                ):
+                    reasons.append("worker-session-cleanup-ack-missing")
+            if attempt.get("state") == "succeeded":
+                committed = [
+                    item for item in rounds
+                    if item.get("attemptId") == attempt_id and item.get("state") == "committed"
+                ]
+                if not committed:
+                    reasons.append("committed-round-unavailable")
+                for item in committed:
+                    if sorted(
+                        contribution.get("workerId")
+                        for contribution in item.get("contributions", [])
+                    ) != sorted(cohort):
+                        reasons.append("round-contribution-cohort-mismatch")
+                    if not isinstance(item.get("aggregateSha256"), str):
+                        reasons.append("round-aggregate-digest-missing")
+                matching_results = [
+                    item for item in results if item["lineage"]["attemptId"] == attempt_id
+                ]
+                if len(matching_results) != 1:
+                    reasons.append("attempt-result-cardinality-mismatch")
+                else:
+                    result = matching_results[0]
+                    matching_publications = [
+                        item for item in publications
+                        if item.get("resultId") == result.get("resultId")
+                        and item["lineage"]["attemptId"] == attempt_id
+                    ]
+                    if len(matching_publications) != 1:
+                        reasons.append("result-publication-cardinality-mismatch")
+                    else:
+                        publication = matching_publications[0]
+                        if publication.get("state") != "acknowledged":
+                            reasons.append("artifact-publication-ack-missing")
+                        elif (
+                            result.get("artifactDigest") != publication.get("artifactDigest")
+                            or result.get("artifactSha256") != publication.get("artifactSha256")
+                        ):
+                            reasons.append("result-publication-digest-mismatch")
+        campaign_state = snapshot["campaign"].get("state")
+        operation = snapshot["selectedOperation"]
+        operation_state = None if operation is None else operation.get("state")
+        terminal = campaign_state in {"succeeded", "failed", "cancelled"} and operation_state in {
+            "succeeded", "failed", "cancelled"
+        }
+        if not terminal:
+            reasons.append("execution-not-terminal")
+        if terminal and not attempts:
+            reasons.append("attempt-evidence-unavailable")
+        if unavailable:
+            reasons.append("historical-lineage-unavailable")
+        reasons = sorted(set(reasons))
+        audit_state = (
+            "unknown"
+            if any("unknown" in item for item in reasons)
+            else "complete" if not reasons else "incomplete"
+        )
+        return {
+            "schemaVersion": "jester-trainer-execution-audit-v1",
+            "identity": {
+                "projectId": None if owner is None else owner.get("projectId"),
+                "deploymentId": None if owner is None else owner.get("deploymentId"),
+                "campaignId": campaign_id,
+                "startOperationId": start_operation_id,
+            },
+            "outcome": {
+                "campaignState": campaign_state,
+                "startOperationState": operation_state,
+            },
+            "auditState": audit_state,
+            "proofComplete": audit_state == "complete",
+            "reasons": reasons,
+            "attempts": sorted(attempts, key=lambda item: item["attemptId"]),
+            "rounds": sorted(rounds, key=lambda item: (item["attemptId"], item["index"])),
+            "results": sorted(results, key=lambda item: item["resultId"]),
+            "publications": sorted(publications, key=lambda item: item["publicationId"]),
+            "workerSessions": sorted(sessions, key=lambda item: item["sessionId"]),
+            "lineageUnavailable": sorted(unavailable, key=lambda item: (item["kind"], item["id"])),
+            "counts": {
+                "attempts": len(attempts), "rounds": len(rounds),
+                "results": len(results), "publications": len(publications),
+                "workerSessions": len(sessions),
+            },
+        }
+
+    @staticmethod
+    def _execution_entity_id(kind: str, item: dict[str, Any]) -> str:
+        key = {
+            "attempt": "attemptId", "round": "roundId", "result": "resultId",
+            "publication": "publicationId", "worker-session": "sessionId",
+        }[kind]
+        value = item.get(key, item.get("id", "unavailable"))
+        return str(value)
+
+    @staticmethod
+    def _historical_entity_job_id(
+        kind: str, item: dict[str, Any], entities: dict[str, list[dict[str, Any]]]
+    ) -> str | None:
+        if isinstance(item.get("jobId"), str):
+            return str(item["jobId"])
+        if kind == "round" and isinstance(item.get("attemptId"), str):
+            attempt = next((
+                value for value in entities["attempt"]
+                if value.get("attemptId") == item["attemptId"]
+            ), None)
+            return None if attempt is None else attempt.get("jobId")
+        if kind == "publication" and isinstance(item.get("resultId"), str):
+            result = next((
+                value for value in entities["result"]
+                if value.get("resultId") == item["resultId"]
+            ), None)
+            return None if result is None else result.get("jobId")
+        return None
+
+    @staticmethod
+    def _attempt_audit_projection(item: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: item[key]
+            for key in ("attemptId", "jobId", "number", "cohort", "state", "lineage")
+            if key in item
+        }
+
+    @staticmethod
+    def _round_audit_projection(item: dict[str, Any]) -> dict[str, Any]:
+        contributions = []
+        for value in item.get("contributions", []):
+            if isinstance(value, dict):
+                contributions.append({
+                    key: value[key]
+                    for key in ("workerId", "gradientSha256", "supervisedTokens", "examples")
+                    if key in value
+                })
+        return {
+            **{
+                key: item[key]
+                for key in (
+                    "roundId", "attemptId", "index", "state", "weightVersion",
+                    "selectionSha256", "aggregateSha256", "lineage",
+                )
+                if key in item
+            },
+            "contributions": contributions,
+        }
+
+    @staticmethod
+    def _session_audit_projection(item: dict[str, Any]) -> dict[str, Any]:
+        projected = {
+            key: item[key]
+            for key in (
+                "id", "campaignId", "jobId", "attemptId", "workerId", "sessionId",
+                "createState", "cleanupState", "lineage",
+            )
+            if key in item
+        }
+        for source, keys in (
+            ("createAck", ("id", "state", "weightVersion", "weightSha256")),
+            ("cleanupAck", ("id", "deleted", "artifactsRetained")),
+        ):
+            ack = item.get(source)
+            if isinstance(ack, dict):
+                projected[source] = {key: ack[key] for key in keys if key in ack}
+        return projected
+
+    @staticmethod
+    def _result_audit_projection(item: dict[str, Any]) -> dict[str, Any]:
+        facet = item.get("facetReference")
+        return {
+            **{
+                key: item[key]
+                for key in (
+                    "resultId", "campaignId", "jobId", "artifactSha256",
+                    "artifactDigest", "lineage",
+                )
+                if key in item
+            },
+            "facetReferenceSha256": (
+                hashlib.sha256(facet.encode("utf-8")).hexdigest()
+                if isinstance(facet, str) else None
+            ),
+        }
+
+    @staticmethod
+    def _publication_audit_projection(item: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: item[key]
+            for key in (
+                "publicationId", "resultId", "artifactDigest", "artifactSha256",
+                "state", "descriptorKind", "descriptorSize", "lineage",
+            )
+            if key in item
         }
 
     def list_results(self) -> list[dict[str, Any]]:
@@ -831,12 +1281,18 @@ class TrainerService:
                     assignments = [(first, list(selected_pool))]
                 errors: list[tuple[str, BaseException]] = []
                 with ThreadPoolExecutor(max_workers=len(assignments)) as executor:
+                    runner = self._run_job_with_retries
+                    runner_parameters = inspect.signature(runner).parameters
                     futures = {
                         executor.submit(
-                            self._run_job_with_retries,
+                            runner,
                             campaign,
                             job,
                             cohort,
+                            **(
+                                {"start_operation_id": operation_id}
+                                if "start_operation_id" in runner_parameters else {}
+                            ),
                         ): job
                         for job, cohort in assignments
                     }
@@ -980,6 +1436,8 @@ class TrainerService:
         campaign: Campaign,
         job: TrainingJob,
         workers: list[WorkerClient],
+        *,
+        start_operation_id: str | None = None,
     ) -> TrainingResult:
         # A manual retry starts a new retry window while preserving the
         # monotonic attempt number for audit/recovery.  Using only
@@ -990,9 +1448,10 @@ class TrainerService:
         for attempt_number in range(job.attempt + 1, maximum + 1):
             self._control_point(campaign.metadata.id)
             try:
-                return self._run_job(
-                    campaign, job, workers, attempt_number=attempt_number
-                )
+                arguments: dict[str, Any] = {"attempt_number": attempt_number}
+                if start_operation_id is not None:
+                    arguments["start_operation_id"] = start_operation_id
+                return self._run_job(campaign, job, workers, **arguments)
             except BaseException as exc:
                 last_error = exc
                 if getattr(exc, "code", None) in {
@@ -1046,7 +1505,15 @@ class TrainerService:
         workers: list[WorkerClient],
         *,
         attempt_number: int,
+        start_operation_id: str | None = None,
     ) -> TrainingResult:
+        owner = self.store.campaign_owner(campaign.metadata.id)
+        if owner is not None and not start_operation_id:
+            raise TrainerError(
+                "Managed training requires its start operation binding",
+                code="execution_lineage_missing",
+                status=409,
+            )
         current = TrainingJob.model_validate(self.get_job(job.job_id))
         running = current.model_copy(
             update={
@@ -1065,11 +1532,20 @@ class TrainerService:
             )
         )
         attempt_id = f"{job.job_id}-a{attempt_number}"
+        lineage = None if owner is None else ExecutionLineage(
+            projectId=owner[0],
+            deploymentId=owner[1],
+            campaignId=campaign.metadata.id,
+            startOperationId=str(start_operation_id),
+            jobId=job.job_id,
+            attemptId=attempt_id,
+        )
         attempt = TrainingAttempt(
             attemptId=attempt_id,
             jobId=job.job_id,
             number=attempt_number,
             cohort=[item.descriptor.worker_id for item in workers],
+            lineage=lineage,
         )
         attempt = TrainingAttempt.model_validate(
             self.store.put_entity("attempt", attempt_id, attempt.api_dict())
@@ -1124,11 +1600,65 @@ class TrainerService:
             result = server.run()
             remote_execution_completed = True
             published_digest = None
+            # A managed retry/start retains each immutable result under the
+            # attempt that produced it.  Unmanaged campaigns preserve their
+            # historical lookup identity.
+            result_id = (
+                f"{attempt_id}-result" if lineage is not None
+                else f"{job.job_id}-result"
+            )
             if self.rm.available:
+                if lineage is None:
+                    raise TrainerError(
+                        "Managed artifact publication has no durable execution lineage",
+                        code="execution_lineage_missing",
+                        status=409,
+                    )
+                publication = ArtifactPublication(
+                    publicationId=f"{attempt_id}-publication",
+                    resultId=result_id,
+                    lineage=lineage,
+                    artifactSha256=result.artifact_sha256,
+                )
+                publication = ArtifactPublication.model_validate(
+                    self.store.put_entity(
+                        "publication", publication.publication_id, publication.api_dict()
+                    )
+                )
                 published = self.rm.publish_artifact(
                     self._relative_to_instance_root(result.artifact_path)
                 )
-                published_digest = published["artifact"]["digest"]
+                descriptor = published.get("artifact")
+                if not isinstance(descriptor, dict):
+                    raise TrainerError(
+                        "RM artifact publication acknowledgement is malformed",
+                        code="artifact_publication_invalid_ack",
+                        status=502,
+                    )
+                published_digest = descriptor.get("digest")
+                if not isinstance(published_digest, str) or not published_digest.strip():
+                    raise TrainerError(
+                        "RM artifact publication acknowledgement omits its digest",
+                        code="artifact_publication_invalid_ack",
+                        status=502,
+                    )
+                acknowledged_publication = publication.model_copy(update={
+                    "state": "acknowledged",
+                    "artifact_digest": published_digest,
+                    "descriptor_kind": (
+                        descriptor.get("kind")
+                        if isinstance(descriptor.get("kind"), str) else None
+                    ),
+                    "descriptor_size": (
+                        descriptor.get("size")
+                        if type(descriptor.get("size")) is int else None
+                    ),
+                })
+                self.store.put_entity(
+                    "publication", publication.publication_id,
+                    acknowledged_publication.api_dict(),
+                    expected_generation=publication.generation,
+                )
             succeeded_attempt = attempt.model_copy(
                 update={"state": "succeeded", "completed_at": utc_now()}
             )
@@ -1138,11 +1668,11 @@ class TrainerService:
                 succeeded_attempt.api_dict(),
                 expected_generation=attempt.generation,
             )
-            result_id = f"{job.job_id}-result"
             training_result = TrainingResult(
                 resultId=result_id,
                 campaignId=campaign.metadata.id,
                 jobId=job.job_id,
+                lineage=lineage,
                 facetReference=result.facet_reference,
                 artifactPath=str(result.artifact_path),
                 artifactSha256=result.artifact_sha256,

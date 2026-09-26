@@ -24,6 +24,9 @@ def _managed_manifest_sha256(payload: dict[str, Any]) -> str:
 
 
 class StateStore:
+    EXECUTION_ENTITY_LIMIT = 2000
+    EXECUTION_OPERATION_LIMIT = 256
+
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -1595,7 +1598,7 @@ class StateStore:
                             code="campaign_start_reconciliation_required",
                         )
                 row = self.connection.execute(
-                    "SELECT generation, created_at FROM entities WHERE kind=? AND entity_id=?",
+                    "SELECT generation, created_at, payload FROM entities WHERE kind=? AND entity_id=?",
                     (kind, entity_id),
                 ).fetchone()
                 if row is None:
@@ -1615,6 +1618,21 @@ class StateStore:
                         )
                     generation = current + 1
                     created = str(row["created_at"])
+                    if kind in {
+                        "attempt", "round", "result", "publication", "worker-session"
+                    }:
+                        previous_lineage = json.loads(row["payload"]).get("lineage")
+                        next_lineage = payload.get("lineage")
+                        if previous_lineage is None and next_lineage is not None:
+                            raise ConflictError(
+                                f"{kind} {entity_id} has no durable execution lineage",
+                                code="execution_lineage_missing",
+                            )
+                        if previous_lineage is not None and previous_lineage != next_lineage:
+                            raise ConflictError(
+                                f"{kind} {entity_id} execution lineage is immutable",
+                                code="execution_lineage_conflict",
+                            )
                 stored = dict(payload)
                 stored.update(
                     {"generation": generation, "createdAt": created, "updatedAt": now}
@@ -1770,6 +1788,158 @@ class StateStore:
                 "SELECT payload FROM operations ORDER BY created_at,operation_id"
             ).fetchall()
         return [json.loads(row["payload"]) for row in rows]
+
+    def execution_snapshot(
+        self, campaign_id: str, *, start_operation_id: str | None
+    ) -> dict[str, Any]:
+        """Read one campaign audit view from a single SQLite snapshot."""
+        entity_limit = self.EXECUTION_ENTITY_LIMIT
+        operation_limit = self.EXECUTION_OPERATION_LIMIT
+        with self._lock:
+            self.connection.execute("BEGIN")
+            try:
+                owner_row = self.connection.execute(
+                    "SELECT project_id,deployment_id FROM campaign_owners WHERE campaign_id=?",
+                    (campaign_id,),
+                ).fetchone()
+                campaign_row = self.connection.execute(
+                    "SELECT payload FROM entities WHERE kind='campaign' AND entity_id=? AND archived=0",
+                    (campaign_id,),
+                ).fetchone()
+                operation_rows = self.connection.execute(
+                    """SELECT payload FROM operations
+                       WHERE json_extract(payload,'$.targetId')=?
+                         AND json_extract(payload,'$.action') IN ('campaign.start','campaign.cancel')
+                       ORDER BY created_at,operation_id LIMIT ?""",
+                    (campaign_id, operation_limit + 1),
+                ).fetchall()
+                if start_operation_id is not None:
+                    selected_operation_row = self.connection.execute(
+                        """SELECT payload FROM operations
+                           WHERE operation_id=?
+                             AND json_extract(payload,'$.targetId')=?
+                             AND json_extract(payload,'$.action')='campaign.start'""",
+                        (start_operation_id, campaign_id),
+                    ).fetchone()
+                else:
+                    selected_operation_row = self.connection.execute(
+                        """SELECT payload FROM operations
+                           WHERE json_extract(payload,'$.targetId')=?
+                             AND json_extract(payload,'$.action')='campaign.start'
+                           ORDER BY created_at DESC,operation_id DESC LIMIT 1""",
+                        (campaign_id,),
+                    ).fetchone()
+                scoped_queries = {
+                    "job": "json_extract(payload,'$.campaignId')=?",
+                    "attempt": """(
+                        json_extract(payload,'$.lineage.campaignId')=? OR
+                        json_extract(payload,'$.jobId') IN (
+                            SELECT entity_id FROM entities
+                            WHERE kind='job' AND archived=0
+                              AND json_extract(payload,'$.campaignId')=?
+                        ))""",
+                    "round": """(
+                        json_extract(payload,'$.lineage.campaignId')=? OR
+                        json_extract(payload,'$.attemptId') IN (
+                            SELECT entity_id FROM entities
+                            WHERE kind='attempt' AND archived=0 AND (
+                                json_extract(payload,'$.lineage.campaignId')=? OR
+                                json_extract(payload,'$.jobId') IN (
+                                    SELECT entity_id FROM entities
+                                    WHERE kind='job' AND archived=0
+                                      AND json_extract(payload,'$.campaignId')=?
+                                )
+                            )
+                        ))""",
+                    "result": "json_extract(payload,'$.campaignId')=?",
+                    "publication": """(
+                        json_extract(payload,'$.lineage.campaignId')=? OR
+                        json_extract(payload,'$.resultId') IN (
+                            SELECT entity_id FROM entities
+                            WHERE kind='result' AND archived=0
+                              AND json_extract(payload,'$.campaignId')=?
+                        ))""",
+                    "worker-session": "json_extract(payload,'$.campaignId')=?",
+                }
+                entity_rows: dict[str, list[sqlite3.Row]] = {}
+                for kind, predicate in scoped_queries.items():
+                    parameters = tuple(
+                        campaign_id for _ in range(predicate.count("?"))
+                    ) + (kind, entity_limit + 1)
+                    entity_rows[kind] = self.connection.execute(
+                        f"""SELECT payload FROM entities WHERE {predicate}
+                            AND kind=? AND archived=0
+                            ORDER BY entity_id LIMIT ?""",
+                        parameters,
+                    ).fetchall()
+                cancel_row = self.connection.execute(
+                    "SELECT * FROM campaign_cancel_reservations WHERE campaign_id=?",
+                    (campaign_id,),
+                ).fetchone()
+                selected_cancel_operation_row = None
+                if cancel_row is not None and (
+                    start_operation_id is None
+                    or cancel_row["start_operation_id"] == start_operation_id
+                ):
+                    selected_cancel_operation_row = self.connection.execute(
+                        """SELECT payload FROM operations
+                           WHERE operation_id=?
+                             AND json_extract(payload,'$.targetId')=?
+                             AND json_extract(payload,'$.action')='campaign.cancel'""",
+                        (cancel_row["cancel_operation_id"], campaign_id),
+                    ).fetchone()
+                self.connection.commit()
+            except BaseException:
+                self.connection.rollback()
+                raise
+        if campaign_row is None:
+            raise NotFoundError("campaign", campaign_id)
+        truncated: list[str] = []
+        if len(operation_rows) > operation_limit:
+            truncated.append("operations")
+        operations = [
+            json.loads(row["payload"])
+            for row in operation_rows[:operation_limit]
+        ]
+        entities: dict[str, list[dict[str, Any]]] = {
+            kind: []
+            for kind in ("job", "attempt", "round", "result", "publication", "worker-session")
+        }
+        for kind, rows in entity_rows.items():
+            if len(rows) > entity_limit:
+                truncated.append(kind)
+            entities[kind] = [
+                json.loads(row["payload"]) for row in rows[:entity_limit]
+            ]
+        cancellation = None
+        if cancel_row is not None and (
+            start_operation_id is None
+            or cancel_row["start_operation_id"] == start_operation_id
+        ):
+            cancellation = {
+                "phase": str(cancel_row["phase"]),
+                "startOperationId": str(cancel_row["start_operation_id"]),
+                "cancelOperationId": str(cancel_row["cancel_operation_id"]),
+            }
+        return {
+            "owner": None if owner_row is None else {
+                "projectId": str(owner_row["project_id"]),
+                "deploymentId": str(owner_row["deployment_id"]),
+            },
+            "campaign": json.loads(campaign_row["payload"]),
+            "operations": operations,
+            "selectedOperation": (
+                None if selected_operation_row is None
+                else json.loads(selected_operation_row["payload"])
+            ),
+            "selectedCancelOperation": (
+                None if selected_cancel_operation_row is None
+                else json.loads(selected_cancel_operation_row["payload"])
+            ),
+            "cancellation": cancellation,
+            "entities": entities,
+            "truncated": sorted(truncated),
+        }
 
     def add_event(self, payload: dict[str, Any]) -> dict[str, Any]:
         with self._lock, self.connection:
