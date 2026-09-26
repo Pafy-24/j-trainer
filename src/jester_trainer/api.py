@@ -74,6 +74,14 @@ def create_app(
                 campaign_id = match.group(1)
             elif request.method == "GET" and (
                 match := re.fullmatch(
+                    r"/v1/campaigns/([^/]+)/results/([^/]+)/publications/([^/]+)/readback",
+                    request.url.path,
+                )
+            ):
+                operation = "trainer.campaign:publication-readback"
+                campaign_id = match.group(1)
+            elif request.method == "GET" and (
+                match := re.fullmatch(
                     r"/v1/campaigns/([^/]+)/execution", request.url.path
                 )
             ):
@@ -410,6 +418,31 @@ def create_app(
         return trainer.campaign_execution(
             campaign_id,
             operation_id=operation_id,
+            expected_project_id=getattr(claims, "project_id", None),
+            expected_deployment_id=getattr(claims, "deployment_id", None),
+        )
+
+    @app.get(
+        "/v1/campaigns/{campaign_id}/results/{result_id}/publications/{publication_id}/readback",
+        dependencies=secured,
+    )
+    def publication_readback(
+        campaign_id: str,
+        result_id: str,
+        publication_id: str,
+        request: Request,
+        operation_id: str | None = Query(default=None, alias="operationId"),
+    ) -> dict[str, Any]:
+        claims = authorize_managed_channel(
+            request,
+            operation="trainer.campaign:publication-readback",
+            campaign_id=campaign_id,
+        )
+        return trainer.publication_readback(
+            campaign_id,
+            result_id,
+            publication_id,
+            operation_id="" if operation_id is None else operation_id,
             expected_project_id=getattr(claims, "project_id", None),
             expected_deployment_id=getattr(claims, "deployment_id", None),
         )

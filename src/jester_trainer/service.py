@@ -5,6 +5,7 @@ import hashlib
 import inspect
 import json
 import os
+import re
 import shutil
 import threading
 import time
@@ -1172,6 +1173,208 @@ class TrainerService:
             )
             if key in item
         }
+
+    def publication_readback(
+        self,
+        campaign_id: str,
+        result_id: str,
+        publication_id: str,
+        *,
+        operation_id: str,
+        expected_project_id: str | None,
+        expected_deployment_id: str | None,
+    ) -> dict[str, Any]:
+        """Return one managed, acknowledged result/publication pair.
+
+        This is intentionally separate from the execution audit: the audit
+        retains only a facet-reference hash, while this selected readback may
+        release the exact reference after the managed ownership checks pass.
+        """
+        if not all(
+            isinstance(value, str) and value.strip()
+            for value in (
+                campaign_id, result_id, publication_id, operation_id,
+                expected_project_id, expected_deployment_id,
+            )
+        ):
+            raise TrainerError(
+                "managed publication readback identity is incomplete",
+                code="publication_readback_denied",
+                status=409,
+            )
+        execution = self.campaign_execution(
+            campaign_id,
+            operation_id=operation_id,
+            expected_project_id=expected_project_id,
+            expected_deployment_id=expected_deployment_id,
+        )
+        audit = execution.get("audit")
+        if not isinstance(audit, dict):
+            raise TrainerError(
+                "managed publication readback audit is unavailable",
+                code="publication_readback_denied",
+                status=409,
+            )
+        identity = audit.get("identity")
+        if (
+            audit.get("proofComplete") is not True
+            or audit.get("auditState") != "complete"
+            or audit.get("outcome") != {
+                "campaignState": "succeeded", "startOperationState": "succeeded"
+            }
+            or identity != {
+                "projectId": expected_project_id,
+                "deploymentId": expected_deployment_id,
+                "campaignId": campaign_id,
+                "startOperationId": operation_id,
+            }
+        ):
+            raise TrainerError(
+                "managed publication readback is not a completed success",
+                code="publication_readback_denied",
+                status=409,
+            )
+        results = audit.get("results")
+        publications = audit.get("publications")
+        attempts = audit.get("attempts")
+        if not all(isinstance(value, list) for value in (results, publications, attempts)):
+            raise TrainerError(
+                "managed publication readback audit is malformed",
+                code="publication_readback_denied",
+                status=409,
+            )
+        selected_results = [
+            item for item in results
+            if isinstance(item, dict) and item.get("resultId") == result_id
+        ]
+        selected_publications = [
+            item for item in publications
+            if isinstance(item, dict) and item.get("publicationId") == publication_id
+        ]
+        if len(selected_results) != 1 or len(selected_publications) != 1:
+            raise TrainerError(
+                "managed publication readback pair is missing or ambiguous",
+                code="publication_readback_denied",
+                status=409,
+            )
+        result_projection = selected_results[0]
+        publication_projection = selected_publications[0]
+        lineage = result_projection.get("lineage")
+        if not isinstance(lineage, dict):
+            raise TrainerError(
+                "managed publication readback lineage is malformed",
+                code="publication_readback_denied",
+                status=409,
+            )
+        try:
+            normalized_lineage = ExecutionLineage.model_validate(lineage)
+        except ValueError as exc:
+            raise TrainerError(
+                "managed publication readback lineage is malformed",
+                code="publication_readback_denied",
+                status=409,
+            ) from exc
+        if (
+            normalized_lineage.api_dict() != lineage
+            or normalized_lineage.project_id != expected_project_id
+            or normalized_lineage.deployment_id != expected_deployment_id
+            or normalized_lineage.campaign_id != campaign_id
+            or normalized_lineage.start_operation_id != operation_id
+        ):
+            raise TrainerError(
+                "managed publication readback lineage authority differs",
+                code="publication_readback_denied",
+                status=409,
+            )
+        matching_attempts = [
+            item for item in attempts
+            if isinstance(item, dict)
+            and item.get("attemptId") == normalized_lineage.attempt_id
+            and item.get("jobId") == normalized_lineage.job_id
+            and item.get("lineage") == lineage
+            and item.get("state") == "succeeded"
+        ]
+        if (
+            len(matching_attempts) != 1
+            or publication_projection.get("resultId") != result_id
+            or publication_projection.get("state") != "acknowledged"
+            or publication_projection.get("lineage") != lineage
+        ):
+            raise TrainerError(
+                "managed publication readback pair is not consumable",
+                code="publication_readback_denied",
+                status=409,
+            )
+        try:
+            result = TrainingResult.model_validate(self.get_result(result_id))
+            publication = ArtifactPublication.model_validate(
+                self.store.get_entity("publication", publication_id)
+            )
+        except (NotFoundError, ValueError) as exc:
+            raise TrainerError(
+                "managed publication readback pair is unavailable",
+                code="publication_readback_denied",
+                status=409,
+            ) from exc
+        facet_reference = result.facet_reference
+        if (
+            result.result_id != result_id
+            or result.campaign_id != campaign_id
+            or result.lineage is None
+            or result.lineage.api_dict() != lineage
+            or result.job_id != normalized_lineage.job_id
+            or publication.publication_id != publication_id
+            or publication.result_id != result_id
+            or publication.lineage.api_dict() != lineage
+            or publication.state != "acknowledged"
+            or not self._canonical_sha256(result.artifact_sha256)
+            or not self._canonical_digest(result.artifact_digest)
+            or not self._canonical_sha256(publication.artifact_sha256)
+            or not self._canonical_digest(publication.artifact_digest)
+            or result.artifact_sha256 != publication.artifact_sha256
+            or result.artifact_digest != publication.artifact_digest
+            or result_projection.get("artifactSha256") != result.artifact_sha256
+            or result_projection.get("artifactDigest") != result.artifact_digest
+            or publication_projection.get("artifactSha256") != publication.artifact_sha256
+            or publication_projection.get("artifactDigest") != publication.artifact_digest
+            or result_projection.get("facetReferenceSha256")
+            != hashlib.sha256(facet_reference.encode("utf-8")).hexdigest()
+        ):
+            raise TrainerError(
+                "managed publication readback authority differs",
+                code="publication_readback_denied",
+                status=409,
+            )
+        return {
+            "schemaVersion": "jester-trainer-publication-readback-v1",
+            "identity": identity,
+            "result": {
+                "resultId": result.result_id,
+                "jobId": result.job_id,
+                "lineage": lineage,
+                "facetReference": facet_reference,
+                "artifactSha256": result.artifact_sha256,
+                "artifactDigest": result.artifact_digest,
+            },
+            "publication": {
+                "publicationId": publication.publication_id,
+                "resultId": publication.result_id,
+                "state": publication.state,
+                "lineage": publication.lineage.api_dict(),
+                "artifactSha256": publication.artifact_sha256,
+                "artifactDigest": publication.artifact_digest,
+                "descriptorKind": publication.descriptor_kind,
+                "descriptorSize": publication.descriptor_size,
+            },
+        }
+
+    @staticmethod
+    def _canonical_sha256(value: Any) -> bool:
+        return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+    @staticmethod
+    def _canonical_digest(value: Any) -> bool:
+        return isinstance(value, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", value) is not None
 
     def list_results(self) -> list[dict[str, Any]]:
         return self.store.list_entities("result")
