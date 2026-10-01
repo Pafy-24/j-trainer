@@ -8,18 +8,14 @@ if os.environ.get("JESTER_CROSS_REPO_TESTS") != "1":
 
 import json
 import os
-import sys
 import threading
+import sysconfig
+from importlib.metadata import distribution
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-HERE = Path(__file__).resolve()
-PACKAGES = HERE.parents[1].parent
-WORKSPACE = PACKAGES.parents[1]
-for source in (PACKAGES / "rm" / "src", WORKSPACE / "jester-core" / "packages" / "python" / "core" / "src"):
-    sys.path.insert(0, str(source))
-
+import jester_rm
 from jester_rm.config import Settings
 from jester_rm.controller.service import ControllerService
 from jester_rm.models import Deployment, EntityMetadata, HostSpec, Lease
@@ -28,6 +24,23 @@ from fastapi.testclient import TestClient
 from jester_trainer.channel_sessions import ManagedChannelContext, ManagedChannelGuard
 from jester_trainer.api import create_app
 from tests.helpers import campaign
+
+
+def _assert_installed_rm_origin() -> None:
+    module_file = Path(jester_rm.__file__).resolve()
+    site_packages = Path(sysconfig.get_paths()["purelib"]).resolve()
+    old_rm_checkout = Path(__file__).resolve().parents[3] / "packages" / "rm"
+    assert module_file.is_relative_to(site_packages), module_file
+    assert not module_file.is_relative_to(old_rm_checkout), module_file
+    installed = distribution("jester-resource-manager")
+    files = tuple(installed.files or ())
+    module_record = next(entry for entry in files if str(entry).replace("\\", "/") == "jester_rm/__init__.py")
+    record = next(entry for entry in files if entry.name == "RECORD")
+    assert Path(installed.locate_file(module_record)).resolve() == module_file
+    assert Path(installed.locate_file(record)).resolve().is_relative_to(site_packages)
+
+
+_assert_installed_rm_origin()
 
 
 class _RouteService: pass
