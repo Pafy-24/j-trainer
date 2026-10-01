@@ -1,0 +1,63 @@
+{
+  "apiVersion": "jester.trainer/v1",
+  "kind": "Campaign",
+  "metadata": {
+    "id": "qwen25-15b-scale-v2-a40-rtx-s42",
+    "displayName": "Qwen controlled cohort-invariant scaling on A40 plus RTX 5070",
+    "labels": {"baseFamily": "qwen2", "experiment": "trainer-scaling-v2", "hardware": "1xa40+1xrtx5070", "seed": "42"}
+  },
+  "spec": {
+    "topologyId": "a40-rtx-training-s42",
+    "datasets": [],
+    "facets": [{
+      "id": "coder",
+      "dependsOn": [],
+      "datasets": [
+        {"datasetId": "coder-v2-2026-08-26", "split": "pretraining", "weight": 1.0},
+        {"datasetId": "coder-v2-2026-08-26", "split": "train", "weight": 1.0}
+      ],
+      "miConfig": {
+        "schemaVersion": "mi-training-v1",
+        "algorithm": {"type": "causal-lm"},
+        "baseModel": {
+          "id": "rm-artifact-pending",
+          "artifactDigest": "sha256:834987060d9f34ffb7fda7688dd589009312eceda220baf83258b39659359f47",
+          "allowDownload": false,
+          "device": "managed",
+          "dtype": "bfloat16",
+          "revision": null
+        },
+        "registry": "artifacts/facets",
+        "facet": {
+          "id": "coder",
+          "version": "scale-v2-a40-rtx-s42",
+          "description": "Cohort-invariant heterogeneous A40 plus RTX scaling probe",
+          "dependencies": {"requires": [], "after": [], "before": [], "conflicts": [], "priority": 20},
+          "module": {
+            "type": "full-decoder-block",
+            "slots": [
+              {"id": "coder-early", "afterLayer": 8, "order": 10, "blocks": [{"sourceLayer": 8, "initializer": "identity-copy"}]},
+              {"id": "coder-middle", "afterLayer": 18, "order": 10, "blocks": [{"sourceLayer": 18, "initializer": "identity-copy"}]}
+            ]
+          },
+          "metadata": {"role": "parent", "trainableScope": "inserted-blocks-only", "experiment": "controlled-scaling-v2", "productionEligible": false}
+        },
+        "data": {"train": [], "maxSequenceLength": 384, "maskPrompt": true, "packing": false, "shuffle": false, "numWorkers": 0},
+        "training": {"precision": "bfloat16", "gradientCheckpointing": true, "identityCheck": false}
+      },
+      "candidates": [{"id": "default", "overrides": {}}]
+    }],
+    "mode": "parameter-server",
+    "cohort": {"workerIds": ["worker-a40-01", "worker-rtx"]},
+    "optimizer": {"type": "adamw", "learningRate": 0.00008, "weightDecay": 0.01, "betas": [0.9, 0.95], "eps": 1e-8, "momentum": 0.0},
+    "scheduler": {"type": "cosine", "warmupSteps": 1},
+    "training": {"maxSteps": 4, "examplesPerWorker": 48, "batchSize": 1, "precision": "bfloat16", "maxGradNorm": 1.0, "seed": 42, "transportDtype": "bfloat16", "compression": "zstd"},
+    "checkpoint": {
+      "outputDirectory": "E:\\Licenta\\Proiect\\.jester-rm-eval\\.jester-rm\\mounts\\trainer-facet-eval-local\\artifacts\\trainer-results",
+      "saveEveryRounds": 4,
+      "maxRetries": 1
+    },
+    "acceptSshDataPlane": true,
+    "allowCpuFallback": false
+  }
+}

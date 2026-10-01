@@ -1,0 +1,28 @@
+{
+  "schemaVersion": "jester-training-evidence-manifest-v1",
+  "name": "qwen25-15b-controlled-scaling-v2-s42",
+  "baselineId": "qwen-scale-v2-1xrtx-s42",
+  "campaigns": [
+    {
+      "id": "qwen-scale-v2-1xrtx-s42",
+      "campaignId": "qwen25-15b-scale-v2-1xrtx-s42",
+      "hardware": "1x RTX 5070 Laptop",
+      "workerCount": 1,
+      "expectedRounds": 4
+    },
+    {
+      "id": "qwen-scale-v2-1xa40-s42",
+      "campaignId": "qwen25-15b-scale-v2-1xa40-s42",
+      "hardware": "1x NVIDIA A40",
+      "workerCount": 1,
+      "expectedRounds": 4
+    },
+    {
+      "id": "qwen-scale-v2-a40-rtx-s42",
+      "campaignId": "qwen25-15b-scale-v2-a40-rtx-s42",
+      "hardware": "1x NVIDIA A40 + 1x RTX 5070 Laptop",
+      "workerCount": 2,
+      "expectedRounds": 4
+    }
+  ]
+}

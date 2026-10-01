@@ -20,6 +20,15 @@ from jester_trainer.util import sha256_file
 from .helpers import campaign as campaign_fixture
 
 
+@pytest.mark.parametrize(
+    "campaign_path",
+    sorted((Path(__file__).parents[1] / "experiments").glob("campaign-*.json")),
+    ids=lambda path: path.stem,
+)
+def test_checked_in_experiment_campaigns_validate(campaign_path: Path) -> None:
+    Campaign.model_validate(json.loads(campaign_path.read_text(encoding="utf-8")))
+
+
 def _manifest(path: Path, *, split: str = "train") -> DatasetManifest:
     return DatasetManifest.model_validate(
         {
