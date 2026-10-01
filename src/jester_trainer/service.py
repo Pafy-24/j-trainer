@@ -6,6 +6,7 @@ import inspect
 import json
 import os
 import re
+import secrets
 import shutil
 import threading
 import time
@@ -15,6 +16,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import psutil
+from pydantic import ValidationError
 
 from .config import Settings
 from .datasets import DatasetManager
@@ -30,6 +32,10 @@ from .models import (
     ExecutionLineage,
     Operation,
     OperationState,
+    PublicationAuthority,
+    PublicationRegistration,
+    PublicationRegistrationRequest,
+    PublicationSourceExpectation,
     TrainingAttempt,
     TrainingJob,
     TrainingResult,
@@ -57,6 +63,7 @@ class TrainerService:
         self._start_calls = 0
         self._closing = False
         self._closed = False
+        self._recover_publications()
         self._recover_campaigns()
 
     def close(self) -> None:
@@ -1528,7 +1535,10 @@ class TrainerService:
                 )
             self._event("CAMPAIGN_SUCCEEDED", campaign_id=campaign_id)
         except BaseException as exc:
-            if getattr(exc, "code", None) == "remote_session_outcome_unknown":
+            if getattr(exc, "code", None) in {
+                "remote_session_outcome_unknown",
+                "artifact_publication_outcome_unknown",
+            }:
                 reservation = self.store.campaign_cancel_reservation(campaign_id)
                 reason = f"{type(exc).__name__}: {exc}"
                 details = {
@@ -1546,7 +1556,7 @@ class TrainerService:
                     campaign_id=campaign_id,
                     severity="error",
                     data={
-                        "code": "remote_session_outcome_unknown",
+                        "code": getattr(exc, "code", "remote_session_outcome_unknown"),
                         "detail": reason,
                         **details,
                     },
@@ -1609,7 +1619,10 @@ class TrainerService:
     ) -> TrainerError:
         def precedence(item: tuple[str, BaseException]) -> tuple[int, str]:
             code = getattr(item[1], "code", "campaign_failed")
-            if code == "remote_session_outcome_unknown":
+            if code in {
+                "remote_session_outcome_unknown",
+                "artifact_publication_outcome_unknown",
+            }:
                 rank = 0
             elif code == "campaign_cancelled":
                 rank = 2
@@ -1660,6 +1673,7 @@ class TrainerService:
                 if getattr(exc, "code", None) in {
                     "campaign_cancelled",
                     "remote_session_outcome_unknown",
+                    "artifact_publication_outcome_unknown",
                 }:
                     raise
                 self._event(
@@ -1802,74 +1816,12 @@ class TrainerService:
         try:
             result = server.run()
             remote_execution_completed = True
-            published_digest = None
             # A managed retry/start retains each immutable result under the
             # attempt that produced it.  Unmanaged campaigns preserve their
             # historical lookup identity.
             result_id = (
                 f"{attempt_id}-result" if lineage is not None
                 else f"{job.job_id}-result"
-            )
-            if self.rm.available:
-                if lineage is None:
-                    raise TrainerError(
-                        "Managed artifact publication has no durable execution lineage",
-                        code="execution_lineage_missing",
-                        status=409,
-                    )
-                publication = ArtifactPublication(
-                    publicationId=f"{attempt_id}-publication",
-                    resultId=result_id,
-                    lineage=lineage,
-                    artifactSha256=result.artifact_sha256,
-                )
-                publication = ArtifactPublication.model_validate(
-                    self.store.put_entity(
-                        "publication", publication.publication_id, publication.api_dict()
-                    )
-                )
-                published = self.rm.publish_artifact(
-                    self._relative_to_instance_root(result.artifact_path)
-                )
-                descriptor = published.get("artifact")
-                if not isinstance(descriptor, dict):
-                    raise TrainerError(
-                        "RM artifact publication acknowledgement is malformed",
-                        code="artifact_publication_invalid_ack",
-                        status=502,
-                    )
-                published_digest = descriptor.get("digest")
-                if not isinstance(published_digest, str) or not published_digest.strip():
-                    raise TrainerError(
-                        "RM artifact publication acknowledgement omits its digest",
-                        code="artifact_publication_invalid_ack",
-                        status=502,
-                    )
-                acknowledged_publication = publication.model_copy(update={
-                    "state": "acknowledged",
-                    "artifact_digest": published_digest,
-                    "descriptor_kind": (
-                        descriptor.get("kind")
-                        if isinstance(descriptor.get("kind"), str) else None
-                    ),
-                    "descriptor_size": (
-                        descriptor.get("size")
-                        if type(descriptor.get("size")) is int else None
-                    ),
-                })
-                self.store.put_entity(
-                    "publication", publication.publication_id,
-                    acknowledged_publication.api_dict(),
-                    expected_generation=publication.generation,
-                )
-            succeeded_attempt = attempt.model_copy(
-                update={"state": "succeeded", "completed_at": utc_now()}
-            )
-            self.store.put_entity(
-                "attempt",
-                attempt_id,
-                succeeded_attempt.api_dict(),
-                expected_generation=attempt.generation,
             )
             training_result = TrainingResult(
                 resultId=result_id,
@@ -1879,24 +1831,96 @@ class TrainerService:
                 facetReference=result.facet_reference,
                 artifactPath=str(result.artifact_path),
                 artifactSha256=result.artifact_sha256,
-                artifactDigest=published_digest,
+                artifactDigest=None,
                 metrics=result.metrics,
             )
-            stored_result = TrainingResult.model_validate(
-                self.store.put_entity(
-                    "result", result_id, training_result.api_dict()
+            if self.rm.available:
+                if lineage is None:
+                    raise TrainerError(
+                        "Managed artifact publication has no durable execution lineage",
+                        code="execution_lineage_missing",
+                        status=409,
+                    )
+                weights_path = Path(result.artifact_path) / "facet.safetensors"
+                observed_sha256 = self._sha256_file(weights_path)
+                if observed_sha256 != result.artifact_sha256:
+                    raise TrainerError(
+                        "Trainer weights changed before publication reservation",
+                        code="artifact_publication_source_changed",
+                        status=409,
+                    )
+                relative_path = self._relative_to_instance_root(Path(result.artifact_path))
+                publication_id = f"{attempt_id}-publication"
+                request = PublicationRegistrationRequest(
+                    relativePath=relative_path,
+                    publicationId=publication_id,
+                    resultId=result_id,
+                    lineage=lineage,
+                    artifactSha256=result.artifact_sha256,
                 )
-            )
-            current = TrainingJob.model_validate(self.get_job(job.job_id))
-            succeeded = current.model_copy(
-                update={"state": "succeeded", "result_id": result_id}
-            )
-            self.store.put_entity(
-                "job",
-                job.job_id,
-                succeeded.api_dict(),
-                expected_generation=current.generation,
-            )
+                publication = ArtifactPublication(
+                    publicationId=publication_id,
+                    resultId=result_id,
+                    lineage=lineage,
+                    artifactSha256=result.artifact_sha256,
+                )
+                source_expectation = self._publication_source_expectation()
+                registration = PublicationRegistration(
+                    registrationId=publication_id,
+                    publicationId=publication_id,
+                    resultId=result_id,
+                    lineage=lineage,
+                    relativePath=relative_path,
+                    artifactSha256=result.artifact_sha256,
+                    idempotencyKey="p" + secrets.token_urlsafe(47),
+                    requestSha256=sha256_json({
+                        "topologyId": self.rm.topology_id,
+                        **request.api_dict(exclude_none=False),
+                    }),
+                    request=request,
+                    sourceExpectation=source_expectation,
+                    startControllerId=self._controller_lease.instance_id,
+                )
+                _stored_result, _stored_publication, stored_registration = (
+                    self.store.reserve_publication_draft(
+                        result=training_result.api_dict(),
+                        publication=publication.api_dict(),
+                        registration=registration.api_dict(exclude_none=False),
+                    )
+                )
+                acknowledged = self._register_reserved_publication(
+                    PublicationRegistration.model_validate(stored_registration)
+                )
+                if not self.store.settle_acknowledged_publication(
+                    acknowledged.registration_id
+                ):
+                    raise TrainerError(
+                        "Campaign cancellation won after publication intent",
+                        code="campaign_cancelled",
+                        status=409,
+                    )
+                stored_result = TrainingResult.model_validate(
+                    self.store.get_entity("result", result_id)
+                )
+            else:
+                succeeded_attempt = attempt.model_copy(
+                    update={"state": "succeeded", "completed_at": utc_now()}
+                )
+                self.store.put_entity(
+                    "attempt", attempt_id, succeeded_attempt.api_dict(),
+                    expected_generation=attempt.generation,
+                )
+                stored_result = TrainingResult.model_validate(
+                    self.store.put_entity("result", result_id, training_result.api_dict())
+                )
+                current = TrainingJob.model_validate(self.get_job(job.job_id))
+                succeeded = current.model_copy(
+                    update={"state": "succeeded", "result_id": result_id}
+                )
+                self.store.put_entity(
+                    "job", job.job_id, succeeded.api_dict(),
+                    expected_generation=current.generation,
+                )
             self._event(
                 "JOB_SUCCEEDED",
                 campaign_id=campaign.metadata.id,
@@ -1989,10 +2013,18 @@ class TrainerService:
         if execution_error is not None:
             if current_attempt.state == "running":
                 cancelled = getattr(execution_error, "code", None) == "campaign_cancelled"
+                uncertain_publication = (
+                    getattr(execution_error, "code", None)
+                    == "artifact_publication_outcome_unknown"
+                )
                 completed_attempt = current_attempt.model_copy(
                     update={
-                        "state": "cancelled" if cancelled else "failed",
-                        "completed_at": utc_now(),
+                        "state": (
+                            "cancelled" if cancelled else
+                            "reconciliation-required" if uncertain_publication else
+                            "failed"
+                        ),
+                        "completed_at": None if uncertain_publication else utc_now(),
                         "error": None
                         if cancelled
                         else {
@@ -2313,6 +2345,234 @@ class TrainerService:
                 code="trainer_path_outside_lease",
                 status=422,
             ) from exc
+
+    @staticmethod
+    def _sha256_file(path: Path) -> str:
+        if not path.is_file():
+            raise TrainerError(
+                "Trainer publication requires facet.safetensors",
+                code="artifact_publication_source_missing",
+                status=409,
+            )
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def _publication_source_expectation(self) -> PublicationSourceExpectation:
+        lease = self.settings.lease
+        instance_id = lease.get("instanceId")
+        lease_id = lease.get("leaseId")
+        host_id = lease.get("hostId")
+        if not all(isinstance(value, str) and value for value in (instance_id, lease_id, host_id)):
+            raise TrainerError(
+                "Trainer lease omits publication source identity",
+                code="publication_source_identity_missing",
+                status=409,
+            )
+        generation = lease.get("instanceGeneration")
+        if generation is not None and (type(generation) is not int or generation < 1):
+            raise TrainerError(
+                "Trainer lease has an invalid instance generation",
+                code="publication_source_identity_invalid",
+                status=409,
+            )
+        host_epoch = lease.get("hostEpoch")
+        if host_epoch is not None and (not isinstance(host_epoch, str) or not host_epoch):
+            raise TrainerError(
+                "Trainer lease has an invalid host epoch",
+                code="publication_source_identity_invalid",
+                status=409,
+            )
+        return PublicationSourceExpectation(
+            trainerInstanceId=instance_id,
+            trainerInstanceGeneration=generation,
+            trainerLeaseId=lease_id,
+            hostId=host_id,
+            hostEpoch=host_epoch,
+        )
+
+    def _validate_publication_authority(
+        self,
+        registration: PublicationRegistration,
+        payload: dict[str, Any],
+    ) -> PublicationAuthority:
+        try:
+            authority = PublicationAuthority.model_validate(payload)
+        except ValidationError as exc:
+            raise TrainerError(
+                "RM publication authority is malformed",
+                code="artifact_publication_invalid_ack",
+                status=502,
+            ) from exc
+        lineage = registration.lineage.api_dict(exclude_none=False)
+        expected_source = registration.source_expectation
+        identity = authority.identity
+        source = authority.source
+        if (
+            identity.project_id != registration.lineage.project_id
+            or identity.deployment_id != registration.lineage.deployment_id
+            or identity.topology_id != self.rm.topology_id
+            or authority.result.result_id != registration.result_id
+            or authority.result.lineage.api_dict(exclude_none=False) != lineage
+            or authority.publication.publication_id != registration.publication_id
+            or authority.publication.artifact_sha256 != registration.artifact_sha256
+            or source.trainer_instance_id != expected_source.trainer_instance_id
+            or source.trainer_lease_id != expected_source.trainer_lease_id
+            or source.host_id != expected_source.host_id
+            or (
+                expected_source.trainer_instance_generation is not None
+                and source.trainer_instance_generation
+                != expected_source.trainer_instance_generation
+            )
+            or (
+                expected_source.host_epoch is not None
+                and source.host_epoch != expected_source.host_epoch
+            )
+        ):
+            raise TrainerError(
+                "RM publication authority differs from the durable Trainer intent",
+                code="artifact_publication_authority_mismatch",
+                status=409,
+            )
+        return authority
+
+    def _register_reserved_publication(
+        self,
+        registration: PublicationRegistration,
+        *,
+        timeout_seconds: float = 3600,
+    ) -> PublicationRegistration:
+        expected_hash = sha256_json({
+            "topologyId": self.rm.topology_id,
+            **registration.request.api_dict(exclude_none=False),
+        })
+        if expected_hash != registration.request_sha256:
+            raise TrainerError(
+                "Durable publication request changed",
+                code="artifact_publication_intent_changed",
+                status=409,
+            )
+        try:
+            response = self.rm.register_trainer_publication(
+                registration.request.api_dict(exclude_none=False),
+                idempotency_key=registration.idempotency_key,
+                timeout_seconds=timeout_seconds,
+            )
+            authority = self._validate_publication_authority(registration, response)
+            _result, _publication, stored = self.store.acknowledge_publication_authority(
+                registration_id=registration.registration_id,
+                expected_generation=registration.generation,
+                authority=authority.api_dict(exclude_none=False),
+            )
+            return PublicationRegistration.model_validate(stored)
+        except BaseException as exc:
+            code = str(getattr(exc, "code", "rm_unavailable"))[:128]
+            try:
+                self.store.mark_publication_reconciliation_required(
+                    registration.registration_id,
+                    error={
+                        "code": code,
+                        "detail": "Publication registration has no accepted RM authority",
+                    },
+                )
+            except BaseException:
+                pass
+            raise TrainerError(
+                "Trainer cannot prove the RM publication outcome",
+                code="artifact_publication_outcome_unknown",
+                status=503,
+                fields={"registrationId": registration.registration_id},
+            ) from exc
+
+    def _recover_publications(self) -> None:
+        """Perform one bounded startup pass without launching training work."""
+
+        payloads = self.store.recoverable_publication_registrations(limit=256)
+        external_replays = 0
+        for payload in payloads:
+            registration: PublicationRegistration | None = None
+            registration_id = payload.get("registrationId")
+            recovery_complete = False
+            recovery_examined = False
+            deferred_code = "publication_recovery_deferred"
+            try:
+                registration = PublicationRegistration.model_validate(payload)
+                if (
+                    self._publication_source_expectation()
+                    != registration.source_expectation
+                ):
+                    recovery_examined = True
+                    raise TrainerError(
+                        "Trainer publication source changed before recovery",
+                        code="artifact_publication_authority_mismatch",
+                        status=409,
+                    )
+                if registration.state == "acknowledged":
+                    recovery_examined = True
+                    if registration.authority is None:
+                        raise TrainerError(
+                            "Acknowledged publication omits its authority",
+                            code="artifact_publication_authority_mismatch",
+                            status=409,
+                        )
+                    self._validate_publication_authority(
+                        registration, registration.authority.api_dict(exclude_none=False)
+                    )
+                    acknowledged = registration
+                else:
+                    if not self.rm.available or external_replays >= 1:
+                        continue
+                    recovery_examined = True
+                    external_replays += 1
+                    acknowledged = self._register_reserved_publication(
+                        registration, timeout_seconds=5
+                    )
+                if not self.store.settle_acknowledged_publication(
+                    acknowledged.registration_id
+                ):
+                    continue
+                recovery_complete = self._settle_recovered_campaign(acknowledged)
+            except BaseException as exc:
+                # The durable registration remains the recovery receipt. Startup
+                # must not turn an uncertain external effect into retraining.
+                deferred_code = str(getattr(exc, "code", deferred_code))[:128]
+            finally:
+                if (
+                    recovery_examined
+                    and not recovery_complete
+                    and isinstance(registration_id, str)
+                ):
+                    try:
+                        self.store.mark_publication_recovery_deferred(
+                            registration_id,
+                            error={
+                                "code": deferred_code,
+                                "detail": "Publication still requires local reconciliation",
+                            },
+                        )
+                    except BaseException:
+                        pass
+
+    def _settle_recovered_campaign(
+        self, registration: PublicationRegistration
+    ) -> bool:
+        lineage = registration.lineage
+        jobs = self.campaign_jobs(lineage.campaign_id)
+        if not jobs or any(item.get("state") != "succeeded" for item in jobs):
+            return False
+        result = {
+            "campaignId": lineage.campaign_id,
+            "results": self.campaign_results(lineage.campaign_id),
+        }
+        return self.store.settle_campaign_succeeded(
+            lineage.campaign_id,
+            lineage.start_operation_id,
+            result,
+            controller_id=registration.start_controller_id,
+            reconciled_publication_registration_id=registration.registration_id,
+        )
 
     def _managed_path(self, value: str) -> Path:
         path = Path(value).expanduser()

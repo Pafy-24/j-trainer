@@ -954,6 +954,7 @@ class StateStore:
         result: dict[str, Any],
         *,
         controller_id: str,
+        reconciled_publication_registration_id: str | None = None,
     ) -> bool:
         """Commit natural success only if a cancel intent did not win first."""
         now = utc_now()
@@ -964,7 +965,10 @@ class StateStore:
                     "SELECT phase FROM campaign_cancel_reservations WHERE campaign_id=?",
                     (campaign_id,),
                 ).fetchone()
-                if cancel is not None and cancel["phase"] != "terminal":
+                if cancel is not None and (
+                    reconciled_publication_registration_id is not None
+                    or cancel["phase"] != "terminal"
+                ):
                     self.connection.commit()
                     return False
                 campaign_row = self.connection.execute(
@@ -979,6 +983,99 @@ class StateStore:
                     raise ConflictError("Campaign execution receipt is missing", code="campaign_start_receipt_missing")
                 campaign = json.loads(campaign_row["payload"])
                 operation = json.loads(operation_row["payload"])
+                if reconciled_publication_registration_id is not None:
+                    registration_row = self.connection.execute(
+                        """SELECT payload FROM entities
+                           WHERE kind='publication-registration' AND entity_id=?
+                             AND archived=0""",
+                        (reconciled_publication_registration_id,),
+                    ).fetchone()
+                    if registration_row is None:
+                        raise ConflictError(
+                            "Publication reconciliation receipt is missing",
+                            code="publication_registration_missing",
+                        )
+                    registration = json.loads(registration_row["payload"])
+                    lineage = registration.get("lineage") or {}
+                    authority = registration.get("authority") or {}
+                    authority_source = authority.get("source") or {}
+                    expected_source = registration.get("sourceExpectation") or {}
+                    owner = self.connection.execute(
+                        "SELECT project_id,deployment_id FROM campaign_owners WHERE campaign_id=?",
+                        (campaign_id,),
+                    ).fetchone()
+                    job_rows = self.connection.execute(
+                        """SELECT payload FROM entities
+                           WHERE kind='job' AND archived=0
+                             AND json_extract(payload,'$.campaignId')=?""",
+                        (campaign_id,),
+                    ).fetchall()
+                    completed_jobs = bool(job_rows)
+                    for job_row in job_rows:
+                        job = json.loads(job_row["payload"])
+                        result_id = job.get("resultId")
+                        result_row = self.connection.execute(
+                            """SELECT payload FROM entities
+                               WHERE kind='result' AND entity_id=? AND archived=0""",
+                            (result_id,),
+                        ).fetchone()
+                        if job.get("state") != "succeeded" or result_row is None:
+                            completed_jobs = False
+                            break
+                        job_result = json.loads(result_row["payload"])
+                        result_lineage = job_result.get("lineage") or {}
+                        attempt_row = self.connection.execute(
+                            """SELECT payload FROM entities
+                               WHERE kind='attempt' AND entity_id=? AND archived=0""",
+                            (result_lineage.get("attemptId"),),
+                        ).fetchone()
+                        if attempt_row is None:
+                            completed_jobs = False
+                            break
+                        result_attempt = json.loads(attempt_row["payload"])
+                        if (
+                            result_lineage.get("campaignId") != campaign_id
+                            or result_lineage.get("jobId") != job.get("jobId")
+                            or result_attempt.get("state") != "succeeded"
+                            or result_attempt.get("lineage") != result_lineage
+                        ):
+                            completed_jobs = False
+                            break
+                    source_matches = (
+                        authority_source.get("trainerInstanceId")
+                        == expected_source.get("trainerInstanceId")
+                        and authority_source.get("trainerLeaseId")
+                        == expected_source.get("trainerLeaseId")
+                        and authority_source.get("hostId")
+                        == expected_source.get("hostId")
+                        and (
+                            expected_source.get("trainerInstanceGeneration") is None
+                            or authority_source.get("trainerInstanceGeneration")
+                            == expected_source.get("trainerInstanceGeneration")
+                        )
+                        and (
+                            expected_source.get("hostEpoch") is None
+                            or authority_source.get("hostEpoch")
+                            == expected_source.get("hostEpoch")
+                        )
+                    )
+                    if (
+                        registration.get("state") != "acknowledged"
+                        or not isinstance(registration.get("authority"), dict)
+                        or lineage.get("campaignId") != campaign_id
+                        or lineage.get("startOperationId") != start_operation_id
+                        or registration.get("startControllerId") != controller_id
+                        or not source_matches
+                        or owner is None
+                        or (
+                            str(owner["project_id"]), str(owner["deployment_id"])
+                        ) != (lineage.get("projectId"), lineage.get("deploymentId"))
+                        or not completed_jobs
+                    ):
+                        raise ConflictError(
+                            "Publication reconciliation receipt does not own the campaign start",
+                            code="publication_authority_mismatch",
+                        )
                 if campaign.get("state") in {"succeeded", "failed", "cancelled"}:
                     self.connection.commit()
                     return campaign.get("state") == "succeeded"
@@ -992,9 +1089,24 @@ class StateStore:
                     "UPDATE operations SET state='succeeded',payload=?,updated_at=? WHERE operation_id=?",
                     (canonical_json(operation), now, start_operation_id),
                 )
+                allowed_phases = (
+                    ("launch-committed", "running", "reconciliation-required")
+                    if reconciled_publication_registration_id is not None
+                    else ("launch-committed", "running")
+                )
+                placeholders = ",".join("?" for _ in allowed_phases)
                 cursor = self.connection.execute(
-                    "UPDATE campaign_start_reservations SET phase='terminal',updated_at=? WHERE campaign_id=? AND operation_id=? AND controller_id=? AND phase!='reconciliation-required'",
-                    (now, campaign_id, start_operation_id, controller_id),
+                    "UPDATE campaign_start_reservations "
+                    "SET phase='terminal',updated_at=? "
+                    "WHERE campaign_id=? AND operation_id=? AND controller_id=? "
+                    f"AND phase IN ({placeholders})",
+                    (
+                        now,
+                        campaign_id,
+                        start_operation_id,
+                        controller_id,
+                        *allowed_phases,
+                    ),
                 )
                 if cursor.rowcount != 1:
                     raise ConflictError("Campaign start reservation is no longer owned", code="campaign_start_reservation_lost")
@@ -1659,6 +1771,475 @@ class StateStore:
                 )
                 self.connection.commit()
                 return stored
+            except BaseException:
+                self.connection.rollback()
+                raise
+
+    @staticmethod
+    def _publication_immutable(payload: dict[str, Any]) -> dict[str, Any]:
+        value = dict(payload)
+        for key in ("generation", "createdAt", "updatedAt"):
+            value.pop(key, None)
+        return value
+
+    def reserve_publication_draft(
+        self,
+        *,
+        result: dict[str, Any],
+        publication: dict[str, Any],
+        registration: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        """Create the complete local draft and external-effect intent atomically."""
+
+        now = utc_now()
+        lineage = registration.get("lineage") or {}
+        campaign_id = str(lineage.get("campaignId", ""))
+        start_operation_id = str(lineage.get("startOperationId", ""))
+        attempt_id = str(lineage.get("attemptId", ""))
+        job_id = str(lineage.get("jobId", ""))
+        rows = (
+            ("result", str(result.get("resultId", "")), result),
+            ("publication", str(publication.get("publicationId", "")), publication),
+            ("publication-registration", str(registration.get("registrationId", "")), registration),
+        )
+        with self._lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                owner = self.connection.execute(
+                    "SELECT project_id,deployment_id FROM campaign_owners WHERE campaign_id=?",
+                    (campaign_id,),
+                ).fetchone()
+                if owner is None or (
+                    str(owner["project_id"]), str(owner["deployment_id"])
+                ) != (lineage.get("projectId"), lineage.get("deploymentId")):
+                    raise ConflictError(
+                        "Publication draft has no exact managed campaign owner",
+                        code="publication_owner_mismatch",
+                    )
+                start = self.connection.execute(
+                    "SELECT controller_id,phase FROM campaign_start_reservations WHERE campaign_id=? AND operation_id=?",
+                    (campaign_id, start_operation_id),
+                ).fetchone()
+                if (
+                    start is None
+                    or start["controller_id"] != registration.get("startControllerId")
+                    or start["phase"] in {"terminal", "reconciliation-required"}
+                ):
+                    raise ConflictError(
+                        "Publication draft is not bound to the active managed start",
+                        code="publication_start_fence_missing",
+                    )
+                cancel = self.connection.execute(
+                    "SELECT 1 FROM campaign_cancel_reservations WHERE campaign_id=?",
+                    (campaign_id,),
+                ).fetchone()
+                if cancel is not None:
+                    raise ConflictError(
+                        "Campaign cancellation forbids a new publication effect",
+                        code="campaign_cancelled",
+                    )
+                attempt_row = self.connection.execute(
+                    "SELECT payload FROM entities WHERE kind='attempt' AND entity_id=? AND archived=0",
+                    (attempt_id,),
+                ).fetchone()
+                job_row = self.connection.execute(
+                    "SELECT payload FROM entities WHERE kind='job' AND entity_id=? AND archived=0",
+                    (job_id,),
+                ).fetchone()
+                if attempt_row is None or job_row is None:
+                    raise ConflictError(
+                        "Publication draft attempt or job is missing",
+                        code="publication_execution_missing",
+                    )
+                attempt = json.loads(attempt_row["payload"])
+                job = json.loads(job_row["payload"])
+                if attempt.get("lineage") != lineage or attempt.get("state") != "running":
+                    raise ConflictError(
+                        "Publication draft attempt lineage is not active",
+                        code="publication_execution_mismatch",
+                    )
+                if job.get("campaignId") != campaign_id or job.get("state") != "running":
+                    raise ConflictError(
+                        "Publication draft job is not active",
+                        code="publication_execution_mismatch",
+                    )
+
+                existing: list[dict[str, Any] | None] = []
+                for kind, entity_id, _payload in rows:
+                    row = self.connection.execute(
+                        "SELECT payload FROM entities WHERE kind=? AND entity_id=? AND archived=0",
+                        (kind, entity_id),
+                    ).fetchone()
+                    existing.append(None if row is None else json.loads(row["payload"]))
+                if any(item is not None for item in existing):
+                    if not all(item is not None for item in existing):
+                        raise ConflictError(
+                            "Publication draft is only partially persisted",
+                            code="publication_draft_conflict",
+                        )
+                    for current, (_kind, _entity_id, desired) in zip(existing, rows):
+                        assert current is not None
+                        if self._publication_immutable(current) != self._publication_immutable(desired):
+                            raise ConflictError(
+                                "Publication draft differs from its durable intent",
+                                code="publication_draft_conflict",
+                            )
+                    self.connection.commit()
+                    return existing[0], existing[1], existing[2]  # type: ignore[return-value]
+
+                stored: list[dict[str, Any]] = []
+                for kind, entity_id, payload in rows:
+                    value = dict(payload)
+                    value.update({"generation": 1, "createdAt": now, "updatedAt": now})
+                    self.connection.execute(
+                        """INSERT INTO entities(kind,entity_id,generation,payload,archived,created_at,updated_at)
+                           VALUES(?,?,1,?,0,?,?)""",
+                        (kind, entity_id, canonical_json(value), now, now),
+                    )
+                    stored.append(value)
+                self.connection.commit()
+                return stored[0], stored[1], stored[2]
+            except BaseException:
+                self.connection.rollback()
+                raise
+
+    def acknowledge_publication_authority(
+        self,
+        *,
+        registration_id: str,
+        expected_generation: int,
+        authority: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        """Commit result digest, public ACK, and private authority in one write."""
+
+        now = utc_now()
+        with self._lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                registration_row = self.connection.execute(
+                    "SELECT generation,payload FROM entities WHERE kind='publication-registration' AND entity_id=?",
+                    (registration_id,),
+                ).fetchone()
+                if registration_row is None:
+                    raise ConflictError("Publication registration is missing", code="publication_registration_missing")
+                registration = json.loads(registration_row["payload"])
+                if int(registration_row["generation"]) != expected_generation:
+                    if registration.get("state") == "acknowledged" and registration.get("authority") == authority:
+                        result = json.loads(self.connection.execute(
+                            "SELECT payload FROM entities WHERE kind='result' AND entity_id=?",
+                            (registration["resultId"],),
+                        ).fetchone()["payload"])
+                        publication = json.loads(self.connection.execute(
+                            "SELECT payload FROM entities WHERE kind='publication' AND entity_id=?",
+                            (registration["publicationId"],),
+                        ).fetchone()["payload"])
+                        self.connection.commit()
+                        return result, publication, registration
+                    raise ConflictError("Publication registration generation changed", code="generation_conflict")
+                if registration.get("state") not in {"pending", "reconciliation-required"}:
+                    raise ConflictError("Publication registration cannot be acknowledged", code="publication_registration_conflict")
+                result_row = self.connection.execute(
+                    "SELECT generation,payload FROM entities WHERE kind='result' AND entity_id=?",
+                    (registration["resultId"],),
+                ).fetchone()
+                publication_row = self.connection.execute(
+                    "SELECT generation,payload FROM entities WHERE kind='publication' AND entity_id=?",
+                    (registration["publicationId"],),
+                ).fetchone()
+                if result_row is None or publication_row is None:
+                    raise ConflictError("Publication draft is incomplete", code="publication_draft_conflict")
+                result = json.loads(result_row["payload"])
+                publication = json.loads(publication_row["payload"])
+                if (
+                    result.get("lineage") != registration.get("lineage")
+                    or publication.get("lineage") != registration.get("lineage")
+                    or publication.get("resultId") != registration.get("resultId")
+                    or result.get("artifactSha256") != registration.get("artifactSha256")
+                    or publication.get("artifactSha256") != registration.get("artifactSha256")
+                    or result.get("artifactDigest") is not None
+                    or publication.get("state") != "dispatched"
+                ):
+                    raise ConflictError("Publication draft changed before acknowledgement", code="publication_draft_conflict")
+                digest = authority["publication"]["artifactDigest"]
+                result.update({
+                    "artifactDigest": digest,
+                    "generation": int(result_row["generation"]) + 1,
+                    "updatedAt": now,
+                })
+                publication.update({
+                    "state": "acknowledged",
+                    "artifactDigest": digest,
+                    "descriptorKind": authority["publication"]["descriptorKind"],
+                    "descriptorSize": authority["publication"].get("descriptorSize"),
+                    "generation": int(publication_row["generation"]) + 1,
+                    "updatedAt": now,
+                })
+                registration.update({
+                    "state": "acknowledged",
+                    "authority": authority,
+                    "error": None,
+                    "generation": int(registration_row["generation"]) + 1,
+                    "updatedAt": now,
+                })
+                for kind, entity_id, payload in (
+                    ("result", registration["resultId"], result),
+                    ("publication", registration["publicationId"], publication),
+                    ("publication-registration", registration_id, registration),
+                ):
+                    self.connection.execute(
+                        "UPDATE entities SET generation=?,payload=?,updated_at=? WHERE kind=? AND entity_id=?",
+                        (payload["generation"], canonical_json(payload), now, kind, entity_id),
+                    )
+                self.connection.commit()
+                return result, publication, registration
+            except BaseException:
+                self.connection.rollback()
+                raise
+
+    def mark_publication_reconciliation_required(
+        self, registration_id: str, *, error: dict[str, Any]
+    ) -> dict[str, Any]:
+        now = utc_now()
+        with self._lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = self.connection.execute(
+                    "SELECT generation,payload FROM entities WHERE kind='publication-registration' AND entity_id=?",
+                    (registration_id,),
+                ).fetchone()
+                if row is None:
+                    raise ConflictError("Publication registration is missing", code="publication_registration_missing")
+                value = json.loads(row["payload"])
+                if value.get("state") == "acknowledged":
+                    self.connection.commit()
+                    return value
+                value.update({
+                    "state": "reconciliation-required",
+                    "error": error,
+                    "generation": int(row["generation"]) + 1,
+                    "updatedAt": now,
+                })
+                self.connection.execute(
+                    "UPDATE entities SET generation=?,payload=?,updated_at=? WHERE kind='publication-registration' AND entity_id=?",
+                    (value["generation"], canonical_json(value), now, registration_id),
+                )
+                self.connection.commit()
+                return value
+            except BaseException:
+                self.connection.rollback()
+                raise
+
+    def settle_acknowledged_publication(self, registration_id: str) -> bool:
+        """Settle attempt/job only; a cancellation fence remains authoritative."""
+
+        now = utc_now()
+        with self._lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                reg_row = self.connection.execute(
+                    "SELECT payload FROM entities WHERE kind='publication-registration' AND entity_id=?",
+                    (registration_id,),
+                ).fetchone()
+                if reg_row is None:
+                    raise ConflictError("Publication registration is missing", code="publication_registration_missing")
+                registration = json.loads(reg_row["payload"])
+                if registration.get("state") != "acknowledged" or not isinstance(registration.get("authority"), dict):
+                    raise ConflictError("Publication registration is not acknowledged", code="publication_registration_incomplete")
+                lineage = registration["lineage"]
+                owner = self.connection.execute(
+                    "SELECT project_id,deployment_id FROM campaign_owners WHERE campaign_id=?",
+                    (lineage["campaignId"],),
+                ).fetchone()
+                start = self.connection.execute(
+                    """SELECT operation_id,controller_id,phase
+                       FROM campaign_start_reservations WHERE campaign_id=?""",
+                    (lineage["campaignId"],),
+                ).fetchone()
+                if owner is None or (
+                    str(owner["project_id"]), str(owner["deployment_id"])
+                ) != (lineage["projectId"], lineage["deploymentId"]):
+                    raise ConflictError(
+                        "Publication owner changed before settlement",
+                        code="publication_owner_mismatch",
+                    )
+                if start is None or (
+                    start["operation_id"] != lineage["startOperationId"]
+                    or start["controller_id"] != registration.get("startControllerId")
+                    or start["phase"] not in {
+                        "launch-committed",
+                        "running",
+                        "reconciliation-required",
+                        "terminal",
+                    }
+                ):
+                    raise ConflictError(
+                        "Publication start fence changed before settlement",
+                        code="publication_start_fence_missing",
+                    )
+                cancel = self.connection.execute(
+                    "SELECT 1 FROM campaign_cancel_reservations WHERE campaign_id=?",
+                    (lineage["campaignId"],),
+                ).fetchone()
+                if cancel is not None:
+                    self.connection.commit()
+                    return False
+                result_row = self.connection.execute(
+                    "SELECT payload FROM entities WHERE kind='result' AND entity_id=?",
+                    (registration["resultId"],),
+                ).fetchone()
+                publication_row = self.connection.execute(
+                    "SELECT payload FROM entities WHERE kind='publication' AND entity_id=?",
+                    (registration["publicationId"],),
+                ).fetchone()
+                attempt_row = self.connection.execute(
+                    "SELECT generation,payload FROM entities WHERE kind='attempt' AND entity_id=?",
+                    (lineage["attemptId"],),
+                ).fetchone()
+                job_row = self.connection.execute(
+                    "SELECT generation,payload FROM entities WHERE kind='job' AND entity_id=?",
+                    (lineage["jobId"],),
+                ).fetchone()
+                if any(
+                    row is None
+                    for row in (result_row, publication_row, attempt_row, job_row)
+                ):
+                    raise ConflictError("Publication settlement records are missing", code="publication_draft_conflict")
+                result = json.loads(result_row["payload"])
+                publication = json.loads(publication_row["payload"])
+                authority = registration["authority"]
+                if (
+                    result.get("lineage") != lineage
+                    or result.get("resultId") != registration.get("resultId")
+                    or publication.get("lineage") != lineage
+                    or publication.get("publicationId")
+                    != registration.get("publicationId")
+                    or publication.get("resultId") != registration.get("resultId")
+                    or publication.get("state") != "acknowledged"
+                    or result.get("artifactSha256")
+                    != registration.get("artifactSha256")
+                    or publication.get("artifactSha256")
+                    != registration.get("artifactSha256")
+                    or result.get("artifactDigest") != authority["publication"]["artifactDigest"]
+                    or publication.get("artifactDigest") != authority["publication"]["artifactDigest"]
+                ):
+                    raise ConflictError("Acknowledged publication tuple changed", code="publication_authority_mismatch")
+                attempt = json.loads(attempt_row["payload"])
+                job = json.loads(job_row["payload"])
+                if attempt.get("lineage") != lineage or job.get("campaignId") != lineage["campaignId"]:
+                    raise ConflictError("Publication settlement lineage changed", code="publication_execution_mismatch")
+                if attempt.get("state") not in {"running", "reconciliation-required", "succeeded"}:
+                    raise ConflictError("Publication attempt cannot be settled", code="publication_execution_mismatch")
+                if job.get("state") not in {"running", "succeeded"}:
+                    raise ConflictError("Publication job cannot be settled", code="publication_execution_mismatch")
+                if (
+                    job.get("state") == "succeeded"
+                    and job.get("resultId") != registration.get("resultId")
+                ):
+                    raise ConflictError(
+                        "Publication job already has a different result",
+                        code="publication_execution_mismatch",
+                    )
+                if attempt.get("state") != "succeeded":
+                    attempt.update({
+                        "state": "succeeded", "completedAt": now, "error": None,
+                        "generation": int(attempt_row["generation"]) + 1, "updatedAt": now,
+                    })
+                    self.connection.execute(
+                        "UPDATE entities SET generation=?,payload=?,updated_at=? WHERE kind='attempt' AND entity_id=?",
+                        (attempt["generation"], canonical_json(attempt), now, lineage["attemptId"]),
+                    )
+                if job.get("state") != "succeeded":
+                    job.update({
+                        "state": "succeeded", "resultId": registration["resultId"], "error": None,
+                        "generation": int(job_row["generation"]) + 1, "updatedAt": now,
+                    })
+                    self.connection.execute(
+                        "UPDATE entities SET generation=?,payload=?,updated_at=? WHERE kind='job' AND entity_id=?",
+                        (job["generation"], canonical_json(job), now, lineage["jobId"]),
+                    )
+                self.connection.commit()
+                return True
+            except BaseException:
+                self.connection.rollback()
+                raise
+
+    def recoverable_publication_registrations(
+        self, *, limit: int = 256
+    ) -> list[dict[str, Any]]:
+        """Return bounded external intents or acknowledged local work left to settle."""
+
+        with self._lock:
+            rows = self.connection.execute(
+                """SELECT registration.payload
+                   FROM entities AS registration
+                   LEFT JOIN entities AS attempt
+                     ON attempt.kind='attempt' AND attempt.archived=0
+                    AND attempt.entity_id=json_extract(
+                        registration.payload,'$.lineage.attemptId'
+                    )
+                   LEFT JOIN entities AS job
+                     ON job.kind='job' AND job.archived=0
+                    AND job.entity_id=json_extract(
+                        registration.payload,'$.lineage.jobId'
+                    )
+                   LEFT JOIN entities AS campaign
+                     ON campaign.kind='campaign' AND campaign.archived=0
+                    AND campaign.entity_id=json_extract(
+                        registration.payload,'$.lineage.campaignId'
+                    )
+                   WHERE registration.kind='publication-registration'
+                     AND registration.archived=0
+                     AND (
+                       json_extract(registration.payload,'$.state')!='acknowledged'
+                       OR COALESCE(json_extract(attempt.payload,'$.state'),'')!='succeeded'
+                       OR COALESCE(json_extract(job.payload,'$.state'),'')!='succeeded'
+                       OR COALESCE(json_extract(campaign.payload,'$.state'),'')!='succeeded'
+                     )
+                   ORDER BY registration.updated_at, registration.entity_id
+                   LIMIT ?""",
+                (limit,),
+            ).fetchall()
+        return [json.loads(row["payload"]) for row in rows]
+
+    def mark_publication_recovery_deferred(
+        self, registration_id: str, *, error: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Rotate inspected local recovery work without changing its receipt."""
+
+        now = utc_now()
+        with self._lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = self.connection.execute(
+                    """SELECT generation,payload FROM entities
+                       WHERE kind='publication-registration' AND entity_id=?""",
+                    (registration_id,),
+                ).fetchone()
+                if row is None:
+                    raise ConflictError(
+                        "Publication registration is missing",
+                        code="publication_registration_missing",
+                    )
+                value = json.loads(row["payload"])
+                value.update(
+                    {
+                        "error": error,
+                        "generation": int(row["generation"]) + 1,
+                        "updatedAt": now,
+                    }
+                )
+                self.connection.execute(
+                    """UPDATE entities SET generation=?,payload=?,updated_at=?
+                       WHERE kind='publication-registration' AND entity_id=?""",
+                    (
+                        value["generation"],
+                        canonical_json(value),
+                        now,
+                        registration_id,
+                    ),
+                )
+                self.connection.commit()
+                return value
             except BaseException:
                 self.connection.rollback()
                 raise

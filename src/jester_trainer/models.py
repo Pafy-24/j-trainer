@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from enum import Enum
 from typing import Any, Literal
 
@@ -16,6 +17,12 @@ class APIModel(BaseModel):
 
     def api_dict(self, *, exclude_none: bool = True) -> dict[str, Any]:
         return self.model_dump(by_alias=True, mode="json", exclude_none=exclude_none)
+
+
+class StrictAPIModel(APIModel):
+    model_config = ConfigDict(
+        populate_by_name=True, extra="forbid", use_enum_values=True, strict=True
+    )
 
 
 class CampaignState(str, Enum):
@@ -385,6 +392,134 @@ class ArtifactPublication(APIModel):
     generation: int = Field(default=1, ge=1)
     created_at: str = Field(default_factory=utc_now, alias="createdAt")
     updated_at: str = Field(default_factory=utc_now, alias="updatedAt")
+
+
+class PublicationSourceExpectation(StrictAPIModel):
+    trainer_instance_id: str = Field(alias="trainerInstanceId")
+    trainer_instance_generation: int | None = Field(
+        default=None, alias="trainerInstanceGeneration", ge=1
+    )
+    trainer_lease_id: str = Field(alias="trainerLeaseId")
+    host_id: str = Field(alias="hostId")
+    host_epoch: str | None = Field(default=None, alias="hostEpoch")
+
+
+class PublicationRegistrationRequest(StrictAPIModel):
+    relative_path: str = Field(alias="relativePath", min_length=1, max_length=1024)
+    publication_id: str = Field(alias="publicationId")
+    result_id: str = Field(alias="resultId")
+    lineage: ExecutionLineage
+    artifact_sha256: str = Field(alias="artifactSha256", pattern=r"[0-9a-f]{64}")
+
+    @field_validator("artifact_sha256")
+    @classmethod
+    def exact_artifact_sha256(cls, value: str) -> str:
+        if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise ValueError("artifactSha256 must be exactly 64 lowercase hex characters")
+        return value
+
+
+class PublicationAuthorityIdentity(StrictAPIModel):
+    project_id: str = Field(alias="projectId")
+    deployment_id: str = Field(alias="deploymentId")
+    deployment_generation: int = Field(alias="deploymentGeneration", ge=1)
+    topology_id: str = Field(alias="topologyId")
+    topology_generation: int = Field(alias="topologyGeneration", ge=1)
+
+
+class PublicationAuthoritySource(StrictAPIModel):
+    trainer_instance_id: str = Field(alias="trainerInstanceId")
+    trainer_instance_generation: int = Field(alias="trainerInstanceGeneration", ge=1)
+    trainer_lease_id: str = Field(alias="trainerLeaseId")
+    host_id: str = Field(alias="hostId")
+    host_epoch: str = Field(alias="hostEpoch")
+
+
+class PublicationAuthorityResult(StrictAPIModel):
+    result_id: str = Field(alias="resultId")
+    lineage: ExecutionLineage
+
+
+class PublicationAuthorityArtifact(StrictAPIModel):
+    publication_id: str = Field(alias="publicationId")
+    state: Literal["acknowledged"]
+    artifact_sha256: str = Field(alias="artifactSha256", pattern=r"[0-9a-f]{64}")
+    artifact_digest: str = Field(
+        alias="artifactDigest", pattern=r"sha256:[0-9a-f]{64}"
+    )
+    descriptor_kind: Literal["directory"] = Field(alias="descriptorKind")
+    descriptor_size: None = Field(default=None, alias="descriptorSize")
+
+    @field_validator("artifact_sha256")
+    @classmethod
+    def exact_artifact_sha256(cls, value: str) -> str:
+        if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise ValueError("artifactSha256 must be exactly 64 lowercase hex characters")
+        return value
+
+    @field_validator("artifact_digest")
+    @classmethod
+    def exact_artifact_digest(cls, value: str) -> str:
+        if re.fullmatch(r"sha256:[0-9a-f]{64}", value) is None:
+            raise ValueError("artifactDigest must be one canonical sha256 digest")
+        return value
+
+
+class PublicationAuthority(StrictAPIModel):
+    schema_version: Literal["jester-rm-trainer-publication-authority-v1"] = Field(
+        alias="schemaVersion"
+    )
+    authority_id: str = Field(alias="authorityId")
+    identity: PublicationAuthorityIdentity
+    source: PublicationAuthoritySource
+    result: PublicationAuthorityResult
+    publication: PublicationAuthorityArtifact
+
+
+class PublicationRegistrationError(StrictAPIModel):
+    code: str = Field(min_length=1, max_length=128)
+    detail: str = Field(min_length=1, max_length=1024)
+
+
+class PublicationRegistration(StrictAPIModel):
+    schema_version: Literal["jester-trainer-publication-registration-v1"] = Field(
+        default="jester-trainer-publication-registration-v1", alias="schemaVersion"
+    )
+    kind: Literal["PublicationRegistration"] = "PublicationRegistration"
+    registration_id: str = Field(alias="registrationId")
+    publication_id: str = Field(alias="publicationId")
+    result_id: str = Field(alias="resultId")
+    lineage: ExecutionLineage
+    relative_path: str = Field(alias="relativePath", min_length=1, max_length=1024)
+    artifact_sha256: str = Field(alias="artifactSha256", pattern=r"[0-9a-f]{64}")
+    idempotency_key: str = Field(
+        alias="idempotencyKey", min_length=32, max_length=256,
+        pattern=r"[A-Za-z0-9][A-Za-z0-9._~-]{31,255}",
+    )
+    request_sha256: str = Field(alias="requestSha256", pattern=r"[0-9a-f]{64}")
+    request: PublicationRegistrationRequest
+    source_expectation: PublicationSourceExpectation = Field(alias="sourceExpectation")
+    start_controller_id: str = Field(alias="startControllerId")
+    state: Literal["pending", "acknowledged", "reconciliation-required"] = "pending"
+    authority: PublicationAuthority | None = None
+    error: PublicationRegistrationError | None = None
+    generation: int = Field(default=1, ge=1)
+    created_at: str = Field(default_factory=utc_now, alias="createdAt")
+    updated_at: str = Field(default_factory=utc_now, alias="updatedAt")
+
+    @field_validator("artifact_sha256", "request_sha256")
+    @classmethod
+    def exact_sha256(cls, value: str) -> str:
+        if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise ValueError("SHA-256 values must be exactly 64 lowercase hex characters")
+        return value
+
+    @field_validator("idempotency_key")
+    @classmethod
+    def exact_idempotency_key(cls, value: str) -> str:
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._~-]{31,255}", value) is None:
+            raise ValueError("idempotencyKey must use the canonical token alphabet")
+        return value
 
 
 class Operation(APIModel):

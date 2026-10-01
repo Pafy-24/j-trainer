@@ -390,16 +390,51 @@ def test_actual_parameter_server_path_captures_lineage_acks_and_retry_results(
 
     class RMStub:
         available = True
+        topology_id = "test-training-topology"
 
-        def publish_artifact(self, relative_path: str) -> dict:
-            suffix = "1" if "attempt-0001" in relative_path else "2"
-            return {"artifact": {
-                "digest": "sha256:" + suffix * 64,
-                "kind": "directory", "size": 123,
-            }}
+        def register_trainer_publication(
+            self,
+            payload: dict,
+            *,
+            idempotency_key: str,
+            timeout_seconds: float = 3600,
+        ) -> dict:
+            del idempotency_key, timeout_seconds
+            suffix = "1" if "attempt-0001" in payload["relativePath"] else "2"
+            source = service._publication_source_expectation().api_dict(
+                exclude_none=False
+            )
+            return {
+                "schemaVersion": "jester-rm-trainer-publication-authority-v1",
+                "authorityId": f"authority-{suffix}",
+                "identity": {
+                    "projectId": OWNER["projectId"],
+                    "deploymentId": OWNER["deploymentId"],
+                    "deploymentGeneration": 1,
+                    "topologyId": self.topology_id,
+                    "topologyGeneration": 1,
+                },
+                "source": source,
+                "result": {
+                    "resultId": payload["resultId"],
+                    "lineage": payload["lineage"],
+                },
+                "publication": {
+                    "publicationId": payload["publicationId"],
+                    "state": "acknowledged",
+                    "artifactSha256": payload["artifactSha256"],
+                    "artifactDigest": "sha256:" + suffix * 64,
+                    "descriptorKind": "directory",
+                    "descriptorSize": None,
+                },
+            }
 
     with worker_topology(tmp_path / "workers", count=2) as topology:
         settings = Settings.for_test(workspace, topology)
+        settings.lease.update({
+            "instanceGeneration": 1,
+            "hostEpoch": "test-host-epoch",
+        })
         settings.lease["paths"]["root"] = str(workspace)
         service = TrainerService(settings)
         try:
@@ -426,6 +461,26 @@ def test_actual_parameter_server_path_captures_lineage_acks_and_retry_results(
             job = TrainingJob.model_validate(service.campaign_jobs(managed.metadata.id)[0])
             workers = service.pool.select(["worker-1", "worker-2"], 2)
             operation_id = "start-production"
+            service.store.reserve_campaign_start(
+                managed.metadata.id,
+                {
+                    "operationId": operation_id,
+                    "action": "campaign.start",
+                    "targetId": managed.metadata.id,
+                    "state": "accepted",
+                },
+                controller_id=service._controller_lease.instance_id,
+            )
+            service.store.mark_campaign_start_launch_committed(
+                managed.metadata.id,
+                operation_id,
+                controller_id=service._controller_lease.instance_id,
+            )
+            assert service.store.mark_campaign_start_running(
+                managed.metadata.id,
+                operation_id,
+                controller_id=service._controller_lease.instance_id,
+            )
             observed_before_effect: list[str] = []
             for worker in workers:
                 original = worker.json

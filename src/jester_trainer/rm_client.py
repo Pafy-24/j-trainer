@@ -30,6 +30,7 @@ class RMScopedClient:
         payload: dict[str, Any] | None = None,
         *,
         timeout_seconds: float = 30,
+        extra_headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         if not self.available:
             raise TrainerError(
@@ -45,6 +46,8 @@ class RMScopedClient:
         if payload is not None:
             data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             headers["Content-Type"] = "application/json"
+        if extra_headers:
+            headers.update(extra_headers)
         request = urllib.request.Request(
             self.base_url + path,
             data=data,
@@ -96,4 +99,19 @@ class RMScopedClient:
             f"/v1/topologies/{self.topology_id}/artifacts/publish",
             {"relativePath": relative_path},
             timeout_seconds=3600,
+        )
+
+    def register_trainer_publication(
+        self,
+        payload: dict[str, Any],
+        *,
+        idempotency_key: str,
+        timeout_seconds: float = 3600,
+    ) -> dict[str, Any]:
+        return self.request(
+            "POST",
+            f"/v1/topologies/{self.topology_id}/trainer-publications",
+            payload,
+            timeout_seconds=timeout_seconds,
+            extra_headers={"Idempotency-Key": idempotency_key},
         )
