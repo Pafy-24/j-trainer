@@ -7,7 +7,7 @@
       "capability": {
         "id": "trainer.campaign",
         "version": "1",
-        "contractSha256": "dc463a1562e667d7842e054f1c08b172f8d32868cc8e1b50d93bff29f5e477c4",
+        "contractSha256": "e841f2f48b2d7ede2b035ac16fab38ea280cc4aebc5bc4962ee0b9978455a0ae",
         "concurrency": {"sharing": "dedicated-only", "maxConcurrentRequests": 1}
       },
       "configurationSchemaResourceId": "trainer.serve.configuration-schema.v1",
@@ -22,7 +22,7 @@
       "kind": "capability-contract",
       "mediaType": "application/json",
       "installedPath": "resources/trainer-campaign-capability-v1.json",
-      "sha256": "dc463a1562e667d7842e054f1c08b172f8d32868cc8e1b50d93bff29f5e477c4"
+      "sha256": "e841f2f48b2d7ede2b035ac16fab38ea280cc4aebc5bc4962ee0b9978455a0ae"
     },
     {
       "id": "trainer.serve.configuration-schema.v1",

@@ -4,8 +4,6 @@
   "version": "1",
   "transport": "http-json",
   "operations": [
-    {"channelOperation": "trainer.dataset:register", "method": "POST", "path": "/v1/datasets"},
-    {"channelOperation": "trainer.dataset:read", "method": "GET", "path": "/v1/datasets/{datasetId}"},
     {"channelOperation": "trainer.campaign:create", "method": "POST", "path": "/v1/campaigns"},
     {"channelOperation": "trainer.campaign:status", "method": "GET", "path": "/v1/campaigns/{campaignId}"},
     {"channelOperation": "trainer.campaign:start", "method": "POST", "path": "/v1/campaigns/{campaignId}/actions/start"},

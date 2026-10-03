@@ -72,8 +72,6 @@ def test_mapping_is_closed_and_leaves_rm_owned_arguments_out() -> None:
 def test_capability_operations_match_actual_managed_api_routes() -> None:
     contract = _json(RESOURCE_ROOT / "trainer-campaign-capability-v1.json")
     expected = {
-        ("trainer.dataset:register", "POST", "/v1/datasets"),
-        ("trainer.dataset:read", "GET", "/v1/datasets/{dataset_id}"),
         ("trainer.campaign:create", "POST", "/v1/campaigns"),
         ("trainer.campaign:status", "GET", "/v1/campaigns/{campaign_id}"),
         ("trainer.campaign:start", "POST", "/v1/campaigns/{campaign_id}/actions/start"),
