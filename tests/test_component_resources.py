@@ -119,13 +119,25 @@ def test_capability_operations_match_actual_managed_api_routes() -> None:
 
 
 def test_daemon_requires_rm_training_topology_and_trainer_role(tmp_path: Path) -> None:
+    installed_mode = os.environ.get("JESTER_TRAINER_INSTALLED_RESOURCE_PROOF") == "1"
+    if installed_mode:
+        distribution = metadata.distribution("jester-trainer")
+        import_root = Path(distribution.locate_file("")).resolve()
+    else:
+        import_root = PACKAGE / "src"
     code = r'''
 import pathlib, sys, types
 sys.path.insert(0, sys.argv[1])
+import jester_core
+import jester_trainer
 from jester_trainer.config import Settings
 from jester_trainer.errors import TrainerError
 
+import_root = pathlib.Path(sys.argv[1]).resolve()
 run_directory = pathlib.Path(sys.argv[2]).resolve()
+assert pathlib.Path(jester_trainer.__file__).resolve().is_relative_to(import_root)
+if sys.argv[3] == "installed":
+    assert pathlib.Path(jester_core.__file__).resolve().is_relative_to(import_root)
 effective = types.SimpleNamespace(run_directory=run_directory, lease={})
 client = types.ModuleType("jester_rm_client")
 client.require_lease = lambda: effective
@@ -164,8 +176,9 @@ print("behavior-ok")
             "-B",
             "-c",
             code,
-            str(PACKAGE / "src"),
+            str(import_root),
             str(tmp_path / "runtime"),
+            "installed" if installed_mode else "source",
         ],
         check=False,
         capture_output=True,
