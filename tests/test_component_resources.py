@@ -4,6 +4,7 @@ import ast
 import hashlib
 import json
 import os
+import subprocess
 import sys
 from importlib import metadata
 from pathlib import Path
@@ -117,12 +118,62 @@ def test_capability_operations_match_actual_managed_api_routes() -> None:
     assert expected <= actual
 
 
-def test_daemon_requires_rm_training_topology_and_trainer_role() -> None:
-    source = (PACKAGE / "src" / "jester_trainer" / "config.py").read_text(encoding="utf-8")
-    assert 'topology.get("topologyType") != "training"' in source
-    assert 'topology.get("role") != "trainer"' in source
-    assert "effective.run_directory / \"trainer\"" in source
-    assert "effective.lease.get(\"ports\", {}).get(\"http\", 8140)" in source
+def test_daemon_requires_rm_training_topology_and_trainer_role(tmp_path: Path) -> None:
+    code = r'''
+import pathlib, sys, types
+sys.path.insert(0, sys.argv[1])
+from jester_trainer.config import Settings
+from jester_trainer.errors import TrainerError
+
+run_directory = pathlib.Path(sys.argv[2]).resolve()
+effective = types.SimpleNamespace(run_directory=run_directory, lease={})
+client = types.ModuleType("jester_rm_client")
+client.require_lease = lambda: effective
+sys.modules["jester_rm_client"] = client
+
+def refused(topology, code):
+    effective.lease = {"context": topology, "ports": {"http": 9123}}
+    try:
+        Settings.from_rm()
+    except TrainerError as exc:
+        assert exc.code == code, (exc.code, code)
+    else:
+        raise AssertionError(f"expected {code}")
+
+refused({"topologyType": "inference", "role": "trainer"}, "rm_training_topology_required")
+refused({"topologyType": "training", "role": "worker"}, "rm_role_mismatch")
+lease = {
+    "context": {"topologyType": "training", "role": "trainer"},
+    "ports": {"http": 9123},
+}
+effective.lease = lease
+settings = Settings.from_rm()
+assert settings.home == run_directory / "trainer"
+assert settings.database == run_directory / "trainer" / "trainer.sqlite3"
+assert settings.token_path == run_directory / "trainer" / "trainer.token"
+assert settings.topology is lease["context"]
+assert settings.lease is lease
+assert settings.api_host == "127.0.0.1"
+assert settings.api_port == 9123
+print("behavior-ok")
+'''
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-B",
+            "-c",
+            code,
+            str(PACKAGE / "src"),
+            str(tmp_path / "runtime"),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "behavior-ok"
 
 
 @pytest.mark.skipif(
