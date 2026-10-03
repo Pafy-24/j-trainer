@@ -1,0 +1,10 @@
+{
+  "schemaVersion": "jester-adapter-mapping-v1",
+  "id": "trainer.serve",
+  "version": "1",
+  "adapter": "trainer.serve",
+  "assetRoles": {},
+  "arguments": [],
+  "environment": {},
+  "additionalArguments": false
+}

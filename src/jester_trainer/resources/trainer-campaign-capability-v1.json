@@ -1,0 +1,16 @@
+{
+  "schemaVersion": "jester-capability-contract-v1",
+  "id": "trainer.campaign",
+  "version": "1",
+  "transport": "http-json",
+  "operations": [
+    {"channelOperation": "trainer.dataset:register", "method": "POST", "path": "/v1/datasets"},
+    {"channelOperation": "trainer.dataset:read", "method": "GET", "path": "/v1/datasets/{datasetId}"},
+    {"channelOperation": "trainer.campaign:create", "method": "POST", "path": "/v1/campaigns"},
+    {"channelOperation": "trainer.campaign:status", "method": "GET", "path": "/v1/campaigns/{campaignId}"},
+    {"channelOperation": "trainer.campaign:start", "method": "POST", "path": "/v1/campaigns/{campaignId}/actions/start"},
+    {"channelOperation": "trainer.campaign:cancel", "method": "POST", "path": "/v1/campaigns/{campaignId}/actions/cancel"},
+    {"channelOperation": "trainer.campaign:execution", "method": "GET", "path": "/v1/campaigns/{campaignId}/execution"},
+    {"channelOperation": "trainer.campaign:publication-readback", "method": "GET", "path": "/v1/campaigns/{campaignId}/results/{resultId}/publications/{publicationId}/readback"}
+  ]
+}

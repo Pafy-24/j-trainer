@@ -35,6 +35,9 @@ package-dir = {"" = "src"}
 where = ["src"]
 include = ["jester_trainer*"]
 
+[tool.setuptools.package-data]
+jester_trainer = ["resources/*.json"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"

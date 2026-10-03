@@ -1,0 +1,9 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:jester:trainer:serve-configuration:v1",
+  "title": "Trainer serve configuration v1",
+  "description": "Reusable daemon configuration only. Campaign, dataset, topology, lease, resource, and training choices are supplied through their owning runtime contracts.",
+  "type": "object",
+  "additionalProperties": false,
+  "maxProperties": 0
+}

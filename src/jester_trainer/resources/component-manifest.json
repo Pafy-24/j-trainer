@@ -1,0 +1,43 @@
+{
+  "schemaVersion": "jester-component-manifest-v2",
+  "id": "trainer",
+  "version": "0.1.0",
+  "capabilities": [
+    {
+      "capability": {
+        "id": "trainer.campaign",
+        "version": "1",
+        "contractSha256": "dc463a1562e667d7842e054f1c08b172f8d32868cc8e1b50d93bff29f5e477c4",
+        "concurrency": {"sharing": "dedicated-only", "maxConcurrentRequests": 1}
+      },
+      "configurationSchemaResourceId": "trainer.serve.configuration-schema.v1",
+      "configurationDefaultsResourceId": null,
+      "capabilityContractResourceId": "trainer.campaign.capability.v1",
+      "adapterMappingResourceId": "trainer.serve.adapter-mapping.v1"
+    }
+  ],
+  "resources": [
+    {
+      "id": "trainer.campaign.capability.v1",
+      "kind": "capability-contract",
+      "mediaType": "application/json",
+      "installedPath": "resources/trainer-campaign-capability-v1.json",
+      "sha256": "dc463a1562e667d7842e054f1c08b172f8d32868cc8e1b50d93bff29f5e477c4"
+    },
+    {
+      "id": "trainer.serve.configuration-schema.v1",
+      "kind": "configuration-schema",
+      "mediaType": "application/schema+json",
+      "installedPath": "resources/trainer-serve-configuration-v1.schema.json",
+      "sha256": "374aac60f677e121dca26ba54140112a06f0eef936ecfe786eb62eeec0bece83"
+    },
+    {
+      "id": "trainer.serve.adapter-mapping.v1",
+      "kind": "adapter-mapping",
+      "mediaType": "application/json",
+      "installedPath": "resources/trainer-serve-adapter-mapping-v1.json",
+      "sha256": "729b1e922904d6bb60b479fc850fdf3a6f588ea3de31bd18040c18481d004f35"
+    }
+  ],
+  "compatibility": []
+}

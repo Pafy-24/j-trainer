@@ -28,3 +28,13 @@ JESTER_TRAINER_TOKEN_FILE=<instance-root>/run/trainer/trainer.token
 
 Contractele și limitele de platformă sunt documentate în `DOCS/`, iar
 schemele generate se află în `schemas/`.
+
+## Resurse instalate pentru daemon
+
+Distribuția include `jester_trainer/resources/component-manifest.json` și
+resursele declarative fixate prin hash pentru capabilitatea gestionată
+`trainer.campaign`. Configurația reutilizabilă a daemonului este exact `{}`:
+hostul, portul, topologia de tip `training`, rolul `trainer`, lease-ul, căile și
+tokenul provin din RM. Campaniile, dataseturile, seed-urile, optimizerul,
+workerii și checkpointurile rămân payload-uri explicite ale operațiilor lor;
+manifestul daemonului nu le configurează și nu le autorizează.
