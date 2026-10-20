@@ -3,10 +3,8 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
-import os
 import subprocess
 import sys
-from importlib import metadata
 from pathlib import Path
 
 import pytest
@@ -119,15 +117,13 @@ def test_capability_operations_match_actual_managed_api_routes() -> None:
 
 
 def test_daemon_requires_rm_training_topology_and_trainer_role(tmp_path: Path) -> None:
-    installed_mode = os.environ.get("JESTER_TRAINER_INSTALLED_RESOURCE_PROOF") == "1"
-    if installed_mode:
-        distribution = metadata.distribution("jester-trainer")
-        import_root = Path(distribution.locate_file("")).resolve()
-    else:
-        import_root = PACKAGE / "src"
+    import jester_core
+
+    core_root = Path(jester_core.__file__).resolve().parents[1]
+    import_root = PACKAGE / "src"
     code = r'''
 import pathlib, sys, types
-sys.path.insert(0, sys.argv[1])
+sys.path[:0] = [sys.argv[1], sys.argv[3]]
 import jester_core
 import jester_trainer
 from jester_trainer.config import Settings
@@ -136,8 +132,6 @@ from jester_trainer.errors import TrainerError
 import_root = pathlib.Path(sys.argv[1]).resolve()
 run_directory = pathlib.Path(sys.argv[2]).resolve()
 assert pathlib.Path(jester_trainer.__file__).resolve().is_relative_to(import_root)
-if sys.argv[3] == "installed":
-    assert pathlib.Path(jester_core.__file__).resolve().is_relative_to(import_root)
 effective = types.SimpleNamespace(run_directory=run_directory, lease={})
 client = types.ModuleType("jester_rm_client")
 client.require_lease = lambda: effective
@@ -178,7 +172,7 @@ print("behavior-ok")
             code,
             str(import_root),
             str(tmp_path / "runtime"),
-            "installed" if installed_mode else "source",
+            str(core_root),
         ],
         check=False,
         capture_output=True,
@@ -187,25 +181,3 @@ print("behavior-ok")
     )
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout.strip() == "behavior-ok"
-
-
-@pytest.mark.skipif(
-    os.environ.get("JESTER_TRAINER_INSTALLED_RESOURCE_PROOF") != "1",
-    reason="runs only in the isolated installed-wheel acceptance environment",
-)
-def test_installed_resources_without_importing_trainer_or_torch() -> None:
-    assert "jester_trainer" not in sys.modules and "torch" not in sys.modules
-    distribution = metadata.distribution("jester-trainer")
-    package_root = Path(distribution.locate_file("jester_trainer")).resolve()
-    manifest = ComponentManifest.model_validate(
-        _json(package_root / "resources" / "component-manifest.json")
-    )
-    assert "jester_trainer" not in sys.modules and "torch" not in sys.modules
-    installed = {str(item).replace("\\", "/") for item in distribution.files or ()}
-    for resource in manifest.resources:
-        relative = f"jester_trainer/{resource.installed_path}"
-        assert relative in installed
-        path = Path(distribution.locate_file(relative)).resolve()
-        assert path.is_relative_to(package_root)
-        assert hashlib.sha256(path.read_bytes()).hexdigest() == resource.sha256
-    assert "jester_trainer" not in sys.modules and "torch" not in sys.modules

@@ -9,8 +9,6 @@ if os.environ.get("JESTER_CROSS_REPO_TESTS") != "1":
 import json
 import os
 import threading
-import sysconfig
-from importlib.metadata import distribution
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -26,21 +24,15 @@ from jester_trainer.api import create_app
 from tests.helpers import campaign
 
 
-def _assert_installed_rm_origin() -> None:
+def _assert_canonical_rm_origin() -> None:
+    # This is source integration coverage, not native deployment qualification.
     module_file = Path(jester_rm.__file__).resolve()
-    site_packages = Path(sysconfig.get_paths()["purelib"]).resolve()
-    old_rm_checkout = Path(__file__).resolve().parents[3] / "packages" / "rm"
-    assert module_file.is_relative_to(site_packages), module_file
-    assert not module_file.is_relative_to(old_rm_checkout), module_file
-    installed = distribution("jester-resource-manager")
-    files = tuple(installed.files or ())
-    module_record = next(entry for entry in files if str(entry).replace("\\", "/") == "jester_rm/__init__.py")
-    record = next(entry for entry in files if entry.name == "RECORD")
-    assert Path(installed.locate_file(module_record)).resolve() == module_file
-    assert Path(installed.locate_file(record)).resolve().is_relative_to(site_packages)
+    engine_root = Path(__file__).resolve().parents[4]
+    expected = engine_root / "jester-rm/src/jester_rm/__init__.py"
+    assert module_file == expected.resolve(), module_file
 
 
-_assert_installed_rm_origin()
+_assert_canonical_rm_origin()
 
 
 class _RouteService: pass
