@@ -38,3 +38,16 @@ hostul, portul, topologia de tip `training`, rolul `trainer`, lease-ul, căile �
 tokenul provin din RM. Campaniile, dataseturile, seed-urile, optimizerul,
 workerii și checkpointurile rămân payload-uri explicite ale operațiilor lor;
 manifestul daemonului nu le configurează și nu le autorizează.
+
+## Shared SDK runtime
+
+Managed-channel validation is shared through `jester_sdk_runtime`; the existing
+component CLI/API and resource checks remain in place. Native builds include
+this support as compiled code. Recipients of the standard Engine Native Blocks
+do not install the authoring SDK separately.
+
+Source development and build hosts require the matching SDK runtime sources
+(`JesterWorkspace/jester-sdk/src` on the development import path), plus Core
+and its RM client. See the [SDK documentation](../../../../jester-sdk/README.md)
+and [workspace build recipes](../../../../compile/README.md). This is a build
+dependency, not a new runtime package installation step.
