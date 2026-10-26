@@ -150,6 +150,27 @@ def _campaign(
     })
 
 
+def test_managed_checkpoint_resolution_preserves_campaign_identity(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    service, payload, _ = _service(tmp_path, monkeypatch)
+    try:
+        service.register_managed_dataset(DatasetManifest.model_validate(payload),
+            project_id="project-a", deployment_id="deployment-a")
+        service.rm = SimpleNamespace(available=True)
+        service.settings.lease["paths"] = {"root": str(tmp_path), "artifacts": str(tmp_path / "artifacts")}
+        campaign = _campaign("relative-checkpoint", tmp_path, global_dataset_ids=["tiny-dataset"])
+        campaign.spec.checkpoint.output_directory = "results"
+        prepared = service._prepare_campaign(campaign)
+        assert prepared.spec == campaign.spec
+        assert prepared.spec.checkpoint.output_directory == "results"
+        assert service._managed_path(prepared.spec.checkpoint.output_directory) == tmp_path / "artifacts/results"
+        campaign.spec.checkpoint.output_directory = "../../outside"
+        with pytest.raises(TrainerError):
+            service._prepare_campaign(campaign)
+    finally:
+        service.close()
+
+
 def test_registration_is_concurrently_idempotent_across_store_connections(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

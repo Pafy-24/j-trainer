@@ -15,7 +15,6 @@ from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable
 
-import psutil
 from pydantic import ValidationError
 
 from .config import Settings
@@ -126,12 +125,6 @@ class TrainerService:
         }
 
     def pool_metrics(self) -> dict[str, Any]:
-        process = psutil.Process()
-        own = {
-            "pid": process.pid,
-            "cpuPercent": process.cpu_percent(interval=None),
-            "ramBytes": process.memory_info().rss,
-        }
         rm_metrics: dict[str, Any] | None = None
         rm_error: dict[str, Any] | None = None
         if self.rm.available:
@@ -194,16 +187,13 @@ class TrainerService:
             and item.get("metric") in {"process.cpu.percent", "process.memory.rss"}
             for item in latest.values()
         )
-        if not trainer_seen:
-            measured["cpuPercent"] += own["cpuPercent"]
-            measured["ramBytes"] += own["ramBytes"]
         return {
             "topologyId": self.settings.topology.get("topologyId"),
-            "trainer": own,
-            "topologyMeasured": measured,
+            "trainer": {"status": "external", "authority": "RMA"},
+            "topologyMeasured": measured if samples else None,
             "physicalCapacity": (rm_metrics or {}).get("physicalCapacity", []),
             "channels": (rm_metrics or {}).get("channels", []),
-            "source": "rm-topology-metrics" if rm_metrics else "trainer-process-only",
+            "source": "rm-topology-metrics" if rm_metrics else "unavailable",
             "trainerIncludedByRM": trainer_seen,
             "rmError": rm_error,
         }
@@ -354,12 +344,10 @@ class TrainerService:
         }.values():
             self.get_dataset(use.dataset_id)
         if self.rm.available:
-            campaign = campaign.model_copy(deep=True)
-            campaign.spec.checkpoint.output_directory = str(
-                self._managed_path(campaign.spec.checkpoint.output_directory)
-            )
+            # Validate the authorized destination without rewriting the public
+            # campaign identity with a device-specific session path.
             self._relative_to_instance_root(
-                Path(campaign.spec.checkpoint.output_directory)
+                self._managed_path(campaign.spec.checkpoint.output_directory)
             )
         return campaign
 
@@ -1786,7 +1774,7 @@ class TrainerService:
         mi_config = _deep_merge(copy.deepcopy(facet.mi_config), candidate.overrides)
         self._materialize_parent_results(campaign, job, mi_config)
         output = (
-            Path(campaign.spec.checkpoint.output_directory).expanduser().resolve()
+            self._managed_path(campaign.spec.checkpoint.output_directory)
             / campaign.metadata.id
             / job.job_id
             / f"attempt-{attempt_number:04d}"

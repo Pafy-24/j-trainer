@@ -43,6 +43,17 @@ def test_pool_metrics_sum_processes_without_double_counting_accelerator_sources(
             "acceleratorMemoryBytes": 225,
         }
         assert result["trainerIncludedByRM"] is True
+        assert result["trainer"] == {"status": "external", "authority": "RMA"}
         assert result["physicalCapacity"][0]["hostId"] == "host-a"
+    finally:
+        service.close()
+
+
+def test_unavailable_rm_does_not_turn_missing_measurements_into_zero(tmp_path: Path) -> None:
+    service = TrainerService(Settings.for_test(tmp_path / "trainer"))
+    try:
+        result = service.pool_metrics()
+        assert result["topologyMeasured"] is None
+        assert result["source"] == "unavailable"
     finally:
         service.close()

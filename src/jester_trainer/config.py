@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from jester_sdk_runtime.launch import ManagedLaunchError, require_managed_lease
+
 from .errors import TrainerError
 from .util import atomic_write_json
 
@@ -24,19 +26,11 @@ class Settings:
     @classmethod
     def from_rm(cls) -> "Settings":
         try:
-            from jester_rm_client import require_lease
-
-            effective = require_lease()
-        except ImportError as exc:
-            raise TrainerError(
-                "RM_LEASE_REQUIRED: jester-rm-client is not installed",
-                code="RM_LEASE_REQUIRED",
-                status=409,
-            ) from exc
-        except Exception as exc:
+            effective = require_managed_lease()
+        except ManagedLaunchError as exc:
             raise TrainerError(
                 f"RM_LEASE_REQUIRED: {exc}",
-                code=getattr(exc, "code", "RM_LEASE_REQUIRED"),
+                code=exc.code,
                 status=409,
             ) from exc
         topology = effective.lease.get("context")
