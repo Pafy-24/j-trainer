@@ -49,5 +49,5 @@ do not install the authoring SDK separately.
 Source development and build hosts require the matching SDK runtime sources
 (`JesterWorkspace/jester-sdk/src` on the development import path), plus Core
 and its RM client. See the [SDK documentation](../../../../jester-sdk/README.md)
-and [workspace build recipes](../../../../compile/README.md). This is a build
+and [workspace build recipes](../../../../j-compile/recipes/README.md). This is a build
 dependency, not a new runtime package installation step.
